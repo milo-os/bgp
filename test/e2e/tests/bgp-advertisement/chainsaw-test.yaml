@@ -1,0 +1,196 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bgp-advertisement
+spec:
+  description: >
+    Verify that BGPAdvertisement resources inject prefixes into the GoBGP RIB
+    and that withdrawal removes them. Requires at least one BGP session to be
+    Established so that RIB adjacency is available.
+  steps:
+    - name: setup-endpoints-and-peering
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              get_ipv6() {
+                kubectl get node "$1" \
+                  -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+                  | grep ':' | head -1
+              }
+              W1=$(get_ipv6 bgp-e2e-worker)
+              W2=$(get_ipv6 bgp-e2e-worker2)
+
+              kubectl apply -f - <<EOF
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: node-bgp-e2e-worker-adv
+                labels:
+                  e2e-test: bgp-advertisement
+              spec:
+                address: "${W1}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: node-bgp-e2e-worker2-adv
+                labels:
+                  e2e-test: bgp-advertisement
+              spec:
+                address: "${W2}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              metadata:
+                name: e2e-adv-mesh
+              spec:
+                selector:
+                  matchLabels:
+                    e2e-test: bgp-advertisement
+                mode: mesh
+                sessionTemplate:
+                  holdTime: 30
+                  keepaliveTime: 10
+              EOF
+
+    - name: wait-for-session-established
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              ATTEMPTS=0
+              while [ "$ATTEMPTS" -lt 60 ]; do
+                STATE=$(kubectl get bgpsessions \
+                  -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
+                  | grep -c "^Established$" || true)
+                [ "$STATE" -ge 1 ] && break
+                ATTEMPTS=$((ATTEMPTS+1))
+                sleep 5
+              done
+              if [ "$STATE" -lt 1 ]; then
+                echo "ERROR: no BGP sessions reached Established"
+                kubectl get bgpsessions -o wide
+                exit 1
+              fi
+              echo "OK: BGP session Established"
+
+    - name: create-bgp-advertisement
+      try:
+        - apply:
+            resource:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPAdvertisement
+              metadata:
+                name: e2e-test-prefix
+              spec:
+                prefixes:
+                  - "2001:db8:e2e::/48"
+
+    - name: assert-advertisement-condition
+      try:
+        - assert:
+            resource:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPAdvertisement
+              metadata:
+                name: e2e-test-prefix
+              status:
+                (advertisedPrefixCount >= `1`): true
+
+    - name: assert-prefix-in-gobgp-rib
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              # Get any bgp pod name to exec into gobgpd
+              POD=$(kubectl -n bgp-system get pod \
+                -l app.kubernetes.io/name=bgp \
+                -o jsonpath='{.items[0].metadata.name}')
+              echo "Checking GoBGP RIB in pod: $POD"
+
+              ATTEMPTS=0
+              FOUND=0
+              while [ "$FOUND" -eq 0 ] && [ "$ATTEMPTS" -lt 30 ]; do
+                OUTPUT=$(kubectl -n bgp-system exec "$POD" -c gobgpd -- \
+                  gobgp global rib -a ipv6 2>/dev/null || true)
+                echo "$OUTPUT" | grep -q "2001:db8:e2e::" && FOUND=1 || true
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$FOUND" -eq 0 ] && sleep 5
+              done
+
+              if [ "$FOUND" -eq 0 ]; then
+                echo "ERROR: prefix 2001:db8:e2e::/48 not found in GoBGP RIB"
+                kubectl -n bgp-system exec "$POD" -c gobgpd -- \
+                  gobgp global rib -a ipv6 || true
+                exit 1
+              fi
+              echo "OK: prefix 2001:db8:e2e::/48 found in GoBGP RIB"
+
+    - name: delete-advertisement-and-verify-withdrawal
+      try:
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPAdvertisement
+              name: e2e-test-prefix
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              POD=$(kubectl -n bgp-system get pod \
+                -l app.kubernetes.io/name=bgp \
+                -o jsonpath='{.items[0].metadata.name}')
+              echo "Verifying prefix withdrawn from GoBGP RIB in pod: $POD"
+
+              ATTEMPTS=0
+              STILL_PRESENT=1
+              while [ "$STILL_PRESENT" -eq 1 ] && [ "$ATTEMPTS" -lt 30 ]; do
+                OUTPUT=$(kubectl -n bgp-system exec "$POD" -c gobgpd -- \
+                  gobgp global rib -a ipv6 2>/dev/null || true)
+                echo "$OUTPUT" | grep -q "2001:db8:e2e::" && STILL_PRESENT=1 || STILL_PRESENT=0
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$STILL_PRESENT" -eq 1 ] && sleep 5
+              done
+
+              if [ "$STILL_PRESENT" -eq 1 ]; then
+                echo "ERROR: prefix 2001:db8:e2e::/48 still in GoBGP RIB after deletion"
+                exit 1
+              fi
+              echo "OK: prefix 2001:db8:e2e::/48 withdrawn from GoBGP RIB"
+
+      finally:
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              name: e2e-adv-mesh
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: node-bgp-e2e-worker-adv
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: node-bgp-e2e-worker2-adv

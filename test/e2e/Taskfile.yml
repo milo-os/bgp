@@ -1,0 +1,152 @@
+version: '3'
+
+vars:
+  CLUSTER_NAME: bgp-e2e
+  KIND_CONFIG: "{{.TASKFILE_DIR}}/kind-config.yaml"
+  KIND_IMAGE: kindest/node:v1.34.0
+  KUBECONFIG: "{{.TASKFILE_DIR}}/.kubeconfig"
+  REPO_ROOT: "{{.TASKFILE_DIR}}/../.."
+  BGP_IMG: ghcr.io/datum-cloud/bgp:e2e-local
+  GOBGPD_IMG: gobgpd:e2e-local
+
+tasks:
+  default:
+    desc: Run the full E2E suite (setup, build, deploy, test, teardown)
+    cmds:
+      - task: cluster-create
+      - task: images-build
+      - task: images-load
+      - task: deploy
+      - task: test
+      - task: cluster-delete
+
+  cluster-create:
+    desc: Create the kind cluster for E2E tests
+    cmds:
+      # Increase inotify limits for file-watching components
+      - sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=524288 || true
+      - kind create cluster
+          --name {{.CLUSTER_NAME}}
+          --config {{.KIND_CONFIG}}
+          --image {{.KIND_IMAGE}}
+          --kubeconfig {{.KUBECONFIG}}
+          --wait 120s
+      # In Docker-outside-of-Docker devcontainers the API server port binding maps
+      # to the host machine, not the devcontainer. Patch the kubeconfig server URL
+      # to use the control-plane container's IP on the kind Docker bridge network.
+      - |
+        CP_IP=$(docker inspect {{.CLUSTER_NAME}}-control-plane \
+          --format '{{`{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}`}}' 2>/dev/null | head -1)
+        if [ -n "$CP_IP" ]; then
+          KUBECONFIG={{.KUBECONFIG}} kubectl config set-cluster kind-{{.CLUSTER_NAME}} \
+            --server=https://${CP_IP}:6443
+        fi
+      # Connect the devcontainer to the kind network so it can reach cluster IPs
+      - |
+        CONTAINER_ID=$(cat /proc/self/cgroup 2>/dev/null | grep -o 'docker/[a-f0-9]*' | head -1 | cut -d/ -f2 || hostname)
+        docker network connect kind "${CONTAINER_ID}" 2>/dev/null || true
+    status:
+      - kind get clusters | grep -q {{.CLUSTER_NAME}}
+
+  cluster-delete:
+    desc: Delete the E2E kind cluster
+    cmds:
+      - kind delete cluster --name {{.CLUSTER_NAME}}
+      - rm -f {{.KUBECONFIG}}
+
+  images-build:
+    desc: Build bgp operator and gobgpd images
+    cmds:
+      - task: images-build-bgp
+      - task: images-build-gobgpd
+
+  images-build-bgp:
+    desc: Build the bgp operator image
+    dir: "{{.REPO_ROOT}}"
+    cmds:
+      - docker build -t {{.BGP_IMG}} -f build/Dockerfile .
+
+  images-build-gobgpd:
+    desc: Build the gobgpd sidecar image
+    cmds:
+      - |
+        docker build --output type=docker -t {{.GOBGPD_IMG}} - <<'DOCKERFILE'
+        FROM golang:1.24-alpine AS build
+        RUN apk add --no-cache git
+        RUN go install github.com/osrg/gobgp/v3/cmd/gobgpd@v3.37.0
+        FROM alpine:3.19
+        COPY --from=build /go/bin/gobgpd /usr/local/bin/gobgpd
+        ENTRYPOINT ["gobgpd"]
+        DOCKERFILE
+
+  images-load:
+    desc: Load locally-built images into the kind cluster
+    cmds:
+      - kind load docker-image {{.BGP_IMG}} --name {{.CLUSTER_NAME}}
+      - kind load docker-image {{.GOBGPD_IMG}} --name {{.CLUSTER_NAME}}
+
+  deploy:
+    desc: Deploy all BGP system components in order
+    cmds:
+      - task: deploy-cilium
+      - task: deploy-crds
+      - task: deploy-bgp-operator
+      - task: deploy-bgp-config
+
+  deploy-cilium:
+    desc: Install Cilium as the base CNI for pod networking
+    cmds:
+      - helm repo add cilium https://helm.cilium.io/ 2>/dev/null || true
+      - helm repo update cilium
+      - KUBECONFIG={{.KUBECONFIG}} helm upgrade --install cilium cilium/cilium
+          --version 1.17.3
+          --namespace kube-system
+          --set cni.exclusive=false
+          --set ipam.mode=kubernetes
+          --set kubeProxyReplacement=false
+          --set ipv6.enabled=true
+          --wait
+          --timeout 3m
+      - KUBECONFIG={{.KUBECONFIG}} kubectl -n kube-system wait
+          --for=condition=Ready
+          pod -l app.kubernetes.io/name=cilium-agent
+          --timeout=180s
+
+  deploy-crds:
+    desc: Apply BGP CRDs and wait for Established
+    cmds:
+      - KUBECONFIG={{.KUBECONFIG}} kubectl apply -k {{.REPO_ROOT}}/config/crd
+      - KUBECONFIG={{.KUBECONFIG}} kubectl wait
+          --for=condition=Established
+          crd/bgpconfigurations.bgp.miloapis.com
+          crd/bgpsessions.bgp.miloapis.com
+          crd/bgpendpoints.bgp.miloapis.com
+          crd/bgppeeringpolicies.bgp.miloapis.com
+          crd/bgpadvertisements.bgp.miloapis.com
+          crd/bgproutepolicies.bgp.miloapis.com
+          --timeout=60s
+
+  deploy-bgp-operator:
+    desc: Deploy BGP operator DaemonSet with gobgpd sidecar
+    cmds:
+      # Apply the deploy kustomization (namespace, RBAC, ConfigMap, DaemonSet)
+      # using an overlay that sets the e2e-local image tags and LOCAL_ENDPOINT.
+      - KUBECONFIG={{.KUBECONFIG}} kubectl apply -k {{.TASKFILE_DIR}}/overlay
+      - KUBECONFIG={{.KUBECONFIG}} kubectl -n bgp-system wait
+          --for=condition=Ready
+          pod -l app.kubernetes.io/name=bgp
+          --timeout=120s
+
+  deploy-bgp-config:
+    desc: Apply the default BGPConfiguration
+    cmds:
+      - KUBECONFIG={{.KUBECONFIG}} kubectl apply -f {{.TASKFILE_DIR}}/fixtures/bgpconfiguration-default.yaml
+
+  test:
+    desc: Run the Chainsaw E2E test suite
+    env:
+      KUBECONFIG: "{{.KUBECONFIG}}"
+    cmds:
+      - chainsaw test
+          --test-dir {{.TASKFILE_DIR}}/tests
+          --config {{.TASKFILE_DIR}}/chainsaw-config.yaml

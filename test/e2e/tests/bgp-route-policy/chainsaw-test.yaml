@@ -1,0 +1,160 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bgp-route-policy
+spec:
+  description: >
+    Verify that BGPRoutePolicy resources are accepted by the API server with valid
+    conditions, and that the operator reconciles them without error. Requires
+    endpoints and a peering session to be established for the policy to have effect.
+  steps:
+    - name: setup-endpoints-and-peering
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              get_ipv6() {
+                kubectl get node "$1" \
+                  -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+                  | grep ':' | head -1
+              }
+              W1=$(get_ipv6 bgp-e2e-worker)
+              W2=$(get_ipv6 bgp-e2e-worker2)
+
+              kubectl apply -f - <<EOF
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: node-bgp-e2e-worker-rp
+                labels:
+                  e2e-test: bgp-route-policy
+              spec:
+                address: "${W1}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: node-bgp-e2e-worker2-rp
+                labels:
+                  e2e-test: bgp-route-policy
+              spec:
+                address: "${W2}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              metadata:
+                name: e2e-rp-mesh
+              spec:
+                selector:
+                  matchLabels:
+                    e2e-test: bgp-route-policy
+                mode: mesh
+                sessionTemplate:
+                  holdTime: 30
+                  keepaliveTime: 10
+              EOF
+
+    - name: wait-for-session-established
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              ATTEMPTS=0
+              while [ "$ATTEMPTS" -lt 60 ]; do
+                STATE=$(kubectl get bgpsessions \
+                  -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
+                  | grep -c "^Established$" || true)
+                [ "$STATE" -ge 1 ] && break
+                ATTEMPTS=$((ATTEMPTS+1))
+                sleep 5
+              done
+              if [ "$STATE" -lt 1 ]; then
+                echo "ERROR: no BGP sessions reached Established"
+                kubectl get bgpsessions -o wide
+                exit 1
+              fi
+              echo "OK: BGP session Established"
+
+    - name: create-export-route-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPRoutePolicy
+              metadata:
+                name: e2e-export-filter
+              spec:
+                type: Export
+                statements:
+                  - prefixSet:
+                      - cidr: "2001:db8::/32"
+                        maskLengthMin: 32
+                        maskLengthMax: 48
+                    action: Accept
+                  - action: Reject
+
+    - name: assert-route-policy-applied
+      try:
+        - assert:
+            resource:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPRoutePolicy
+              metadata:
+                name: e2e-export-filter
+              # The resource should be accepted by the API server and have no
+              # error conditions set by the operator.
+              (metadata.name): e2e-export-filter
+
+    - name: assert-no-error-condition
+      try:
+        - script:
+            env:
+              - name: KUBECONFIG
+                value: ($env.KUBECONFIG)
+            content: |
+              set -e
+              # If the operator sets any error condition the test fails.
+              CONDITIONS=$(kubectl get bgproutepolicy e2e-export-filter \
+                -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || echo "")
+              if echo "$CONDITIONS" | grep -qi "error\|failed\|invalid"; then
+                echo "ERROR: unexpected error condition on BGPRoutePolicy"
+                kubectl get bgproutepolicy e2e-export-filter -o yaml
+                exit 1
+              fi
+              echo "OK: no error conditions on BGPRoutePolicy"
+
+      finally:
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPRoutePolicy
+              name: e2e-export-filter
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              name: e2e-rp-mesh
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: node-bgp-e2e-worker-rp
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: node-bgp-e2e-worker2-rp
