@@ -15,18 +15,18 @@ images:
 
 # Patch to set LOCAL_ENDPOINT to "node-$(NODE_NAME)" so each DaemonSet pod
 # registers its endpoint under the correct node-scoped name.
+# Uses JSON patch to modify only the specific env var without replacing the list.
 patches:
-  - patch: |-
-      apiVersion: apps/v1
+  - target:
       kind: DaemonSet
-      metadata:
-        name: bgp
-        namespace: bgp-system
-      spec:
-        template:
-          spec:
-            containers:
-              - name: bgp
-                env:
-                  - name: LOCAL_ENDPOINT
-                    value: "node-$(NODE_NAME)"
+      name: bgp
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          - name: LOCAL_ENDPOINT
+            value: "node-$(NODE_NAME)"
