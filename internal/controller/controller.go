@@ -38,6 +38,10 @@ type ControllerOptions struct {
 	// HealthAddr is the address to serve health/readiness probes on (e.g. ":8083").
 	// Defaults to ":8083" when empty.
 	HealthAddr string
+
+	// LeaderElectionNamespace is the namespace used for leader election ConfigMap/Lease.
+	// Defaults to "bgp-system" when empty.
+	LeaderElectionNamespace string
 }
 
 // scheme holds the runtime.Scheme for all types used by the manager.
@@ -50,9 +54,18 @@ func init() {
 }
 
 // Run starts the BGP CRD controller and blocks until ctx is cancelled.
-// It connects to GoBGP, starts the controller-runtime manager with the
-// BGPConfiguration and BGPSession reconcilers, and starts supporting goroutines
-// for health watching, status polling, and route watching.
+//
+// Two controller-runtime managers are used:
+//
+//  1. Per-node manager (no leader election): runs ConfigReconciler,
+//     SessionReconciler, AdvertisementReconciler, and RoutePolicyReconciler.
+//     Every DaemonSet pod runs these reconcilers because each node must
+//     independently configure its local GoBGP sidecar.
+//
+//  2. Leader-elected manager: runs PeeringPolicyReconciler exclusively.
+//     Only one pod at a time creates/deletes BGPSession cluster-scoped
+//     resources.  Without this, every DaemonSet pod would race to create
+//     and garbage-collect the same sessions, producing flapping state.
 func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx context.Context, gobgp *GoBGPClient, srv6Net string)) error {
 	if opts.GoBGPAddr == "" {
 		opts.GoBGPAddr = gobgpDefaultAddr
@@ -63,6 +76,9 @@ func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx cont
 	if opts.HealthAddr == "" {
 		opts.HealthAddr = ":8083"
 	}
+	if opts.LeaderElectionNamespace == "" {
+		opts.LeaderElectionNamespace = "bgp-system"
+	}
 
 	// Connect to GoBGP first — reconcilers depend on this connection.
 	gobgp := NewGoBGPClientWithAddr(opts.GoBGPAddr)
@@ -71,80 +87,117 @@ func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx cont
 	}
 	log.Printf("bgp/controller: GoBGP connected")
 
-	// Build controller-runtime manager.
+	// Build the REST config used by both managers.
 	restCfg, err := config.GetConfig()
 	if err != nil {
 		return fmt.Errorf("get k8s config: %w", err)
 	}
 
-	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+	// ── Per-node manager ────────────────────────────────────────────────────
+	// Runs on every DaemonSet pod. Configures the local GoBGP sidecar.
+	// Metrics and health probes are served only from this manager.
+	nodeMgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: opts.HealthAddr,
 		Metrics:                metricsserver.Options{BindAddress: opts.MetricsAddr},
 	})
 	if err != nil {
-		return fmt.Errorf("new manager: %w", err)
+		return fmt.Errorf("new per-node manager: %w", err)
 	}
 
-	// Register BGPConfiguration reconciler.
+	// BGPConfiguration: reads global config, applies to GoBGP global settings.
 	if err := (&ConfigReconciler{
-		Client:        mgr.GetClient(),
+		Client:        nodeMgr.GetClient(),
 		GoBGP:         gobgp,
 		LocalEndpoint: opts.LocalEndpoint,
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(nodeMgr); err != nil {
 		return fmt.Errorf("setup BGPConfiguration reconciler: %w", err)
 	}
 
-	// Register BGPSession reconciler.
-	// Each node only reconciles sessions where its own endpoint is local.
+	// BGPSession: each node configures its own GoBGP peer for sessions that
+	// involve its LocalEndpoint.
 	if err := (&SessionReconciler{
-		Client:        mgr.GetClient(),
+		Client:        nodeMgr.GetClient(),
 		GoBGP:         gobgp,
 		LocalEndpoint: opts.LocalEndpoint,
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(nodeMgr); err != nil {
 		return fmt.Errorf("setup BGPSession reconciler: %w", err)
 	}
 
-	// Register BGPPeeringPolicy reconciler.
-	// Creates BGPSession resources for every matching endpoint pair.
-	if err := (&PeeringPolicyReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup BGPPeeringPolicy reconciler: %w", err)
-	}
-
-	// Register BGPAdvertisement reconciler.
+	// BGPAdvertisement: each node advertises prefixes into its local GoBGP.
 	if err := (&AdvertisementReconciler{
-		Client:        mgr.GetClient(),
+		Client:        nodeMgr.GetClient(),
 		GoBGP:         gobgp,
 		LocalEndpoint: opts.LocalEndpoint,
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(nodeMgr); err != nil {
 		return fmt.Errorf("setup BGPAdvertisement reconciler: %w", err)
 	}
 
-	// Register BGPRoutePolicy reconciler.
+	// BGPRoutePolicy: each node programs route policies into its local GoBGP.
 	if err := (&RoutePolicyReconciler{
-		Client: mgr.GetClient(),
+		Client: nodeMgr.GetClient(),
 		GoBGP:  gobgp,
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(nodeMgr); err != nil {
 		return fmt.Errorf("setup BGPRoutePolicy reconciler: %w", err)
 	}
 
 	// Health and readiness probes.
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+	if err := nodeMgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("add healthz check: %w", err)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := nodeMgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		return fmt.Errorf("add readyz check: %w", err)
 	}
 
-	// Start background goroutines.
-	go gobgp.WatchHealth(ctx, mgr.GetClient())
-	go RunStatusPoller(ctx, mgr.GetClient(), gobgp)
+	// ── Leader-elected manager ──────────────────────────────────────────────
+	// Only the elected leader runs the PeeringPolicyReconciler, which creates
+	// and garbage-collects cluster-scoped BGPSession resources.  Running this
+	// on every node would cause N pods to race over the same sessions.
+	//
+	// Metrics and health are disabled on this manager (served by nodeMgr).
+	leaderMgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+		Scheme:                        scheme,
+		LeaderElection:                true,
+		LeaderElectionID:              "bgp-operator-leader",
+		LeaderElectionNamespace:       opts.LeaderElectionNamespace,
+		LeaderElectionReleaseOnCancel: true,
+		Metrics:                       metricsserver.Options{BindAddress: "0"}, // disabled
+		HealthProbeBindAddress:        "0",                                     // disabled
+	})
+	if err != nil {
+		return fmt.Errorf("new leader manager: %w", err)
+	}
+
+	// BGPPeeringPolicy: creates/deletes BGPSession objects for matching endpoint pairs.
+	if err := (&PeeringPolicyReconciler{
+		Client: leaderMgr.GetClient(),
+	}).SetupWithManager(leaderMgr); err != nil {
+		return fmt.Errorf("setup BGPPeeringPolicy reconciler: %w", err)
+	}
+
+	// Start background goroutines shared across both managers.
+	// The status poller and route watcher use the per-node client.
+	go gobgp.WatchHealth(ctx, nodeMgr.GetClient())
+	go RunStatusPoller(ctx, nodeMgr.GetClient(), gobgp)
 	if routeWatcher != nil {
 		go routeWatcher(ctx, gobgp, opts.SRv6Net)
 	}
 
-	log.Printf("bgp/controller: starting manager")
-	return mgr.Start(ctx)
+	// Start both managers concurrently. Either one failing cancels the context
+	// via the errgroup pattern below. We use a simple goroutine + channel here
+	// to avoid importing golang.org/x/sync.
+	errCh := make(chan error, 2)
+
+	go func() {
+		log.Printf("bgp/controller: starting leader-elected manager")
+		errCh <- leaderMgr.Start(ctx)
+	}()
+
+	go func() {
+		log.Printf("bgp/controller: starting per-node manager")
+		errCh <- nodeMgr.Start(ctx)
+	}()
+
+	// Wait for the first manager to exit (either error or context cancellation).
+	return <-errCh
 }

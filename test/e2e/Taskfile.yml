@@ -152,3 +152,4 @@ tasks:
       - chainsaw test
           --test-dir {{.TASKFILE_DIR}}/tests
           --config {{.TASKFILE_DIR}}/chainsaw-config.yaml
+          --parallel 1

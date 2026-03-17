@@ -62,3 +62,32 @@ subjects:
   - kind: ServiceAccount
     name: bgp-operator
     namespace: bgp-system
+---
+# Role for leader election: the operator uses a Lease in its own namespace
+# to elect a single pod as the leader for cluster-wide resource management.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bgp-operator-leader-election
+  namespace: bgp-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bgp-operator-leader-election
+  namespace: bgp-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bgp-operator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: bgp-operator
+    namespace: bgp-system
