@@ -1,0 +1,12 @@
+apiVersion: chainsaw.kyverno.io/v1alpha2
+kind: Configuration
+metadata:
+  name: bgp-e2e
+spec:
+  timeouts:
+    apply: 2m
+    assert: 5m
+    delete: 2m
+    # 3m exec timeout: the delete-session-and-verify-peer-removed step polls up
+    # to 30 times with 5s sleep (150s max), which exceeds the previous 2m limit.
+    exec: 3m

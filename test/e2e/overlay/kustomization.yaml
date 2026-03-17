@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base deploy resources: namespace, RBAC, ConfigMap, DaemonSet
+resources:
+  - ../../../config/deploy
+
+# Override image tags for local e2e builds
+images:
+  - name: ghcr.io/datum-cloud/bgp
+    newTag: e2e-local
+  - name: gobgpd
+    newName: gobgpd
+    newTag: e2e-local
+
+# Patch to set LOCAL_ENDPOINT to "node-$(NODE_NAME)" so each DaemonSet pod
+# registers its endpoint under the correct node-scoped name.
+# Uses JSON patch to modify only the specific env var without replacing the list.
+patches:
+  - target:
+      kind: DaemonSet
+      name: bgp
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          - name: LOCAL_ENDPOINT
+            value: "$(NODE_NAME)"

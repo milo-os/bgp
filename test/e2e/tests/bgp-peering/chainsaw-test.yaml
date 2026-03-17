@@ -1,0 +1,250 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bgp-peering
+spec:
+  description: >
+    Verify that BGPEndpoints + BGPPeeringPolicy in mesh mode produce BGPSession
+    resources that reach Established state.
+  steps:
+    - name: resolve-worker-node-ips
+      try:
+        # Capture IPv6 addresses of the three worker nodes into a ConfigMap so
+        # subsequent steps can reference them as endpoint addresses. kind worker
+        # nodes are named bgp-e2e-worker, bgp-e2e-worker2, bgp-e2e-worker3.
+        - script:
+            content: |
+              set -e
+              get_ipv6() {
+                kubectl get node "$1" \
+                  -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+                  | grep ':' | head -1
+              }
+              W1=$(get_ipv6 bgp-e2e-worker)
+              W2=$(get_ipv6 bgp-e2e-worker2)
+              W3=$(get_ipv6 bgp-e2e-worker3)
+              echo "worker1=$W1 worker2=$W2 worker3=$W3"
+
+              # Write resolved IPs into a scratch ConfigMap for assertion reference
+              kubectl create configmap bgp-e2e-node-ips \
+                --from-literal=worker1="${W1}" \
+                --from-literal=worker2="${W2}" \
+                --from-literal=worker3="${W3}" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: create-bgp-endpoints
+      try:
+        - script:
+            content: |
+              set -e
+              get_ipv6() {
+                kubectl get node "$1" \
+                  -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+                  | grep ':' | head -1
+              }
+              W1=$(get_ipv6 bgp-e2e-worker)
+              W2=$(get_ipv6 bgp-e2e-worker2)
+              W3=$(get_ipv6 bgp-e2e-worker3)
+
+              # Endpoint names must exactly match the kind worker node names so that the
+              # session reconciler (LOCAL_ENDPOINT=$(NODE_NAME)) processes these sessions.
+              kubectl apply -f - <<EOF
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: bgp-e2e-worker
+                labels:
+                  e2e-test: bgp-peering
+                  topology.kubernetes.io/region: region1
+              spec:
+                address: "${W1}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: bgp-e2e-worker2
+                labels:
+                  e2e-test: bgp-peering
+                  topology.kubernetes.io/region: region2
+              spec:
+                address: "${W2}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              ---
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              metadata:
+                name: bgp-e2e-worker3
+                labels:
+                  e2e-test: bgp-peering
+                  topology.kubernetes.io/region: region3
+              spec:
+                address: "${W3}"
+                asNumber: 65000
+                addressFamilies:
+                  - afi: IPv6
+                    safi: Unicast
+              EOF
+
+    - name: wait-for-endpoint-cache-sync
+      try:
+        - script:
+            content: |
+              set -e
+              # Wait for all 3 endpoints to have the e2e-test label visible
+              for i in $(seq 1 30); do
+                COUNT=$(kubectl get bgpendpoints -l e2e-test=bgp-peering --no-headers 2>/dev/null | wc -l)
+                if [ "$COUNT" -ge 3 ]; then
+                  echo "OK: $COUNT endpoints with e2e-test=bgp-peering label"
+                  exit 0
+                fi
+                echo "Waiting for endpoints to have labels ($COUNT/3)..."
+                sleep 2
+              done
+              echo "ERROR: only $COUNT/3 endpoints have the label after 60s"
+              exit 1
+
+    - name: create-peering-policy-mesh
+      try:
+        - apply:
+            resource:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              metadata:
+                name: e2e-mesh
+              spec:
+                selector:
+                  matchLabels:
+                    e2e-test: bgp-peering
+                mode: mesh
+                sessionTemplate:
+                  holdTime: 30
+                  keepaliveTime: 10
+
+    - name: assert-policy-matched-endpoints
+      try:
+        - script:
+            content: |
+              set -e
+              # Wait for matchedEndpoints to reach 3 and print diagnostic info.
+              ATTEMPTS=0
+              MATCHED=0
+              # 36 attempts × 5s = 180s, within the 3-minute exec timeout.
+              while [ "$MATCHED" -lt 3 ] && [ "$ATTEMPTS" -lt 36 ]; do
+                MATCHED=$(kubectl get bgppeeringpolicy e2e-mesh \
+                  -o jsonpath='{.status.matchedEndpoints}' 2>/dev/null || echo 0)
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$MATCHED" -lt 3 ] && sleep 5
+              done
+              if [ "$MATCHED" -lt 3 ]; then
+                echo "ERROR: matchedEndpoints=$MATCHED (want 3) after ${ATTEMPTS} attempts"
+                echo "Policy state:"
+                kubectl get bgppeeringpolicy e2e-mesh -o yaml || true
+                echo "Endpoints with label:"
+                kubectl get bgpendpoints -l e2e-test=bgp-peering -o wide || true
+                echo "BGP pod logs (policy reconciler):"
+                for POD in $(kubectl get pods -n bgp-system -l app.kubernetes.io/name=bgp -o name 2>/dev/null); do
+                  echo "--- $POD ---"
+                  kubectl logs -n bgp-system "$POD" -c bgp --tail=200 2>/dev/null | grep -E "bgp/policy|bgp/session" | tail -20 || true
+                done
+                exit 1
+              fi
+              echo "OK: matchedEndpoints=$MATCHED"
+
+    - name: assert-sessions-created
+      try:
+        - script:
+            content: |
+              set -e
+              # Wait for 3 BGPSession resources to be created by the policy.
+              ATTEMPTS=0
+              COUNT=0
+              while [ "$COUNT" -lt 3 ] && [ "$ATTEMPTS" -lt 36 ]; do
+                COUNT=$(kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh --no-headers 2>/dev/null | wc -l)
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$COUNT" -lt 3 ] && sleep 5
+              done
+              if [ "$COUNT" -lt 3 ]; then
+                echo "ERROR: only $COUNT/3 sessions created after ${ATTEMPTS} attempts"
+                kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh -o wide || true
+                exit 1
+              fi
+              echo "OK: $COUNT sessions created"
+
+    - name: assert-sessions-established
+      try:
+        # Each BGPSession should reach Established state.
+        # Filter by the policy label to avoid counting sessions from other tests.
+        - script:
+            content: |
+              set -e
+              # Wait up to 5 minutes (chainsaw assert timeout) for all sessions
+              ESTABLISHED=0
+              ATTEMPTS=0
+              while [ "$ESTABLISHED" -lt 3 ] && [ "$ATTEMPTS" -lt 60 ]; do
+                ESTABLISHED=$(kubectl get bgpsessions \
+                  -l bgp.miloapis.com/policy=e2e-mesh \
+                  -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
+                  | grep -c "^Established$" || true)
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$ESTABLISHED" -lt 3 ] && sleep 5
+              done
+              if [ "$ESTABLISHED" -lt 3 ]; then
+                echo "ERROR: only $ESTABLISHED/3 sessions reached Established"
+                kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh -o wide
+                exit 1
+              fi
+              echo "OK: $ESTABLISHED/3 sessions are Established"
+
+      finally:
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPPeeringPolicy
+              name: e2e-mesh
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: bgp-e2e-worker
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: bgp-e2e-worker2
+        - delete:
+            ref:
+              apiVersion: bgp.miloapis.com/v1alpha1
+              kind: BGPEndpoint
+              name: bgp-e2e-worker3
+        - delete:
+            ref:
+              apiVersion: v1
+              kind: ConfigMap
+              name: bgp-e2e-node-ips
+
+    - name: assert-sessions-cleaned-up
+      try:
+        - script:
+            content: |
+              set -e
+              ATTEMPTS=0
+              COUNT=1
+              while [ "$COUNT" -gt 0 ] && [ "$ATTEMPTS" -lt 30 ]; do
+                COUNT=$(kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh \
+                  --no-headers 2>/dev/null | wc -l || echo 0)
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$COUNT" -gt 0 ] && sleep 5
+              done
+              if [ "$COUNT" -gt 0 ]; then
+                echo "ERROR: $COUNT BGPSessions still exist after policy deletion"
+                kubectl get bgpsessions -o wide
+                exit 1
+              fi
+              echo "OK: all BGPSessions cleaned up"

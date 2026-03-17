@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit Tests
+        run: go test ./...
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    env:
+      KUBECONFIG: ${{ github.workspace }}/test/e2e/.kubeconfig
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install kind
+        run: |
+          go install sigs.k8s.io/kind@latest
+          kind version
+
+      - name: Install task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install chainsaw
+        run: |
+          CHAINSAW_VERSION=v0.2.12
+          curl -sSL "https://github.com/kyverno/chainsaw/releases/download/${CHAINSAW_VERSION}/chainsaw_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin chainsaw
+          chainsaw version
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Run E2E suite
+        working-directory: test/e2e
+        run: task default
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Pods in bgp-system ==="
+          kubectl get pods -n bgp-system -o wide || true
+          echo ""
+          echo "=== Logs from bgp-system pods ==="
+          for POD in $(kubectl get pods -n bgp-system -l app.kubernetes.io/name=bgp -o name 2>/dev/null); do
+            echo "--- $POD ---"
+            kubectl logs -n bgp-system "$POD" -c bgp --tail=500 2>/dev/null | grep -v "bgp/config: resolved" | tail -50 || true
+          done
+          echo ""
+          echo "=== Events in bgp-system ==="
+          kubectl get events -n bgp-system --sort-by='.lastTimestamp' || true
+          echo ""
+          echo "=== Events in kube-system ==="
+          kubectl get events -n kube-system --sort-by='.lastTimestamp' | tail -40 || true
+          echo ""
+          echo "=== Node status ==="
+          kubectl get nodes -o wide || true
+          echo ""
+          echo "=== BGP resources ==="
+          kubectl get bgpconfigurations,bgpsessions,bgpendpoints,bgppeeringpolicies,bgpadvertisements,bgproutepolicies --all-namespaces 2>/dev/null || true
+
+      - name: Upload logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          path: |
+            test/e2e/.kubeconfig
+          retention-days: 7
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name bgp-e2e || true

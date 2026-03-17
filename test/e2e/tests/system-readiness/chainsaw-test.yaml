@@ -1,0 +1,85 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: system-readiness
+spec:
+  description: Verify BGP system components are healthy before running functional tests
+  steps:
+    - name: bgp-daemonset-ready
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: bgp
+                namespace: bgp-system
+              status:
+                (numberReady == desiredNumberScheduled): true
+
+    - name: bgp-pods-two-containers
+      try:
+        # Each pod runs bgp + gobgpd — verify at least one pod has both containers ready.
+        - script:
+            content: |
+              set -e
+              READY=$(kubectl -n bgp-system get pods \
+                -l app.kubernetes.io/name=bgp \
+                -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' \
+                | grep -c "true true" || true)
+              if [ "$READY" -eq 0 ]; then
+                echo "ERROR: no bgp pods found with both containers ready (bgp + gobgpd)"
+                exit 1
+              fi
+              echo "OK: $READY pod(s) with both containers ready"
+
+    - name: crds-established
+      try:
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgpconfigurations.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgpsessions.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgpendpoints.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgppeeringpolicies.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgpadvertisements.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
+        - assert:
+            resource:
+              apiVersion: apiextensions.k8s.io/v1
+              kind: CustomResourceDefinition
+              metadata:
+                name: bgproutepolicies.bgp.miloapis.com
+              status:
+                (conditions[?type=='Established'].status | [0]): "True"
