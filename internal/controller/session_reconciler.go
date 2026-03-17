@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +23,10 @@ const (
 	// SessionFinalizer is the finalizer added to BGPSession resources to ensure
 	// GoBGP DeletePeer is called before the resource is removed from etcd.
 	SessionFinalizer = "bgp.miloapis.com/session-cleanup"
+
+	// sessionRequeueInterval is how often the reconciler re-checks the live peer
+	// state in GoBGP and refreshes the SessionEstablished condition and metrics.
+	sessionRequeueInterval = 30 * time.Second
 )
 
 // SessionReconciler reconciles BGPSession resources into GoBGP AddPeer/DeletePeer calls.
@@ -36,6 +41,10 @@ type SessionReconciler struct {
 // Reconcile ensures the GoBGP peer state matches the BGPSession spec.
 // It resolves the LocalEndpoint and RemoteEndpoint BGPEndpoint resources to
 // obtain addresses and AS numbers, then programs GoBGP accordingly.
+// After configuring the peer it performs a one-shot ListPeer to set the
+// SessionEstablished condition and emit Prometheus metrics. A RequeueAfter
+// of 30 seconds ensures the condition is refreshed periodically without a
+// dedicated polling goroutine.
 func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	var session bgpv1alpha1.BGPSession
 	if err := r.Get(ctx, req.NamespacedName, &session); err != nil {
@@ -135,8 +144,14 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Update Configured condition.
+	// Query the live peer state from GoBGP and update both the SessionEstablished
+	// condition and Prometheus metrics. This replaces the old polling goroutine:
+	// state is refreshed on every reconcile plus on the 30-second RequeueAfter.
+	sessionState, isEstablished, rxPrefixes := r.queryPeerState(ctx, c, remoteEP.Spec.Address)
+
+	// Build the full status patch: Configured=True + SessionEstablished.
 	statusPatch := client.MergeFrom(session.DeepCopy())
+
 	apimeta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 		Type:               bgpv1alpha1.BGPSessionConfigured,
 		Status:             metav1.ConditionTrue,
@@ -144,12 +159,99 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		Message:            fmt.Sprintf("peer %s added to GoBGP", remoteEP.Spec.Address),
 		ObservedGeneration: session.Generation,
 	})
+
+	establishedStatus := metav1.ConditionFalse
+	if isEstablished {
+		establishedStatus = metav1.ConditionTrue
+	}
+	apimeta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
+		Type:    bgpv1alpha1.BGPSessionEstablished,
+		Status:  establishedStatus,
+		Reason:  sessionState,
+		Message: "GoBGP session state: " + sessionState,
+	})
+
 	if err := r.Status().Patch(ctx, &session, statusPatch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch session status: %w", err)
 	}
 
-	log.Printf("bgp/session: reconciled %s (local=%s remote=%s)", session.Name, localEP.Spec.Address, remoteEP.Spec.Address)
-	return ctrl.Result{}, nil
+	// Emit Prometheus metrics. Flap detection is handled by comparing the
+	// previous condition status: if the condition just transitioned from True
+	// to False this reconcile, record a flap.
+	RecordSessionState(session.Name, sessionState)
+	RecordReceivedPrefixes(session.Name, rxPrefixes)
+
+	prevEstablished := apimeta.FindStatusCondition(session.Status.Conditions, bgpv1alpha1.BGPSessionEstablished)
+	if prevEstablished != nil && prevEstablished.Status == metav1.ConditionTrue && !isEstablished {
+		RecordSessionFlap(session.Name)
+	}
+
+	log.Printf("bgp/session: reconciled %s (local=%s remote=%s state=%s)",
+		session.Name, localEP.Spec.Address, remoteEP.Spec.Address, sessionState)
+
+	// Requeue after 30 seconds to refresh the SessionEstablished condition
+	// and metrics without a dedicated polling goroutine.
+	return ctrl.Result{RequeueAfter: sessionRequeueInterval}, nil
+}
+
+// queryPeerState performs a one-shot ListPeer for the given neighbor address
+// and returns the session state string, whether it is Established, and the
+// total received prefix count across all address families.
+func (r *SessionReconciler) queryPeerState(ctx context.Context, c gobgpapi.GobgpApiClient, neighborAddr string) (state string, isEstablished bool, rxPrefixes int64) {
+	stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{
+		Address:          neighborAddr,
+		EnableAdvertised: true,
+	})
+	if err != nil {
+		log.Printf("bgp/session: ListPeer %s: %v", neighborAddr, err)
+		return "Unknown", false, 0
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		p := resp.Peer
+		if p == nil {
+			continue
+		}
+		stateStr, established := peerStateToString(p)
+		var rx int64
+		for _, af := range p.AfiSafis {
+			if af.State != nil {
+				rx += int64(af.State.Received)
+			}
+		}
+		return stateStr, established, rx
+	}
+	return "Unknown", false, 0
+}
+
+// peerStateToString maps GoBGP peer state to a human-readable string.
+// Returns (state string, isEstablished bool).
+func peerStateToString(p *gobgpapi.Peer) (string, bool) {
+	if p.State == nil {
+		return "Unknown", false
+	}
+	switch p.State.SessionState {
+	case gobgpapi.PeerState_UNKNOWN:
+		return "Unknown", false
+	case gobgpapi.PeerState_IDLE:
+		return "Idle", false
+	case gobgpapi.PeerState_CONNECT:
+		return "Connect", false
+	case gobgpapi.PeerState_ACTIVE:
+		return "Active", false
+	case gobgpapi.PeerState_OPENSENT:
+		return "OpenSent", false
+	case gobgpapi.PeerState_OPENCONFIRM:
+		return "OpenConfirm", false
+	case gobgpapi.PeerState_ESTABLISHED:
+		return "Established", true
+	default:
+		return "Unknown", false
+	}
 }
 
 // handleDelete calls GoBGP DeletePeer and removes the finalizer.

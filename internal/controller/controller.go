@@ -151,7 +151,6 @@ func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx cont
 
 	// Start background goroutines.
 	go gobgp.WatchHealth(ctx, mgr.GetClient())
-	go RunStatusPoller(ctx, mgr.GetClient(), gobgp)
 	if routeWatcher != nil {
 		go routeWatcher(ctx, gobgp, opts.SRv6Net)
 	}
