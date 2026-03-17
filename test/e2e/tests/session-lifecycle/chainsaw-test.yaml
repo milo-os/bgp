@@ -20,11 +20,13 @@ spec:
               W2=$(get_ipv6 bgp-e2e-worker2)
               W3=$(get_ipv6 bgp-e2e-worker3)
 
+              # Endpoint names must exactly match the kind worker node names so that the
+              # session reconciler (LOCAL_ENDPOINT=$(NODE_NAME)) processes this session.
               kubectl apply -f - <<EOF
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
               metadata:
-                name: bgp-e2e-worker2-lc
+                name: bgp-e2e-worker2
                 labels:
                   e2e-test: session-lifecycle
               spec:
@@ -37,7 +39,7 @@ spec:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
               metadata:
-                name: bgp-e2e-worker3-lc
+                name: bgp-e2e-worker3
                 labels:
                   e2e-test: session-lifecycle
               spec:
@@ -52,8 +54,8 @@ spec:
               metadata:
                 name: e2e-manual-session-w2-w3
               spec:
-                localEndpoint: bgp-e2e-worker2-lc
-                remoteEndpoint: bgp-e2e-worker3-lc
+                localEndpoint: bgp-e2e-worker2
+                remoteEndpoint: bgp-e2e-worker3
                 holdTime: 30
                 keepaliveTime: 10
               EOF
@@ -86,7 +88,7 @@ spec:
         - script:
             content: |
               set -e
-              # Get the worker2 bgp pod (it owns the local endpoint)
+              # Get the IPv6 address of worker3 (the remote endpoint from worker2's perspective)
               W3=$(kubectl get node bgp-e2e-worker3 \
                 -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
                 | grep ':' | head -1)
@@ -138,9 +140,9 @@ spec:
             ref:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
-              name: bgp-e2e-worker2-lc
+              name: bgp-e2e-worker2
         - delete:
             ref:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
-              name: bgp-e2e-worker3-lc
+              name: bgp-e2e-worker3

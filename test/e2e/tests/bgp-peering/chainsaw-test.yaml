@@ -46,6 +46,8 @@ spec:
               W2=$(get_ipv6 bgp-e2e-worker2)
               W3=$(get_ipv6 bgp-e2e-worker3)
 
+              # Endpoint names must exactly match the kind worker node names so that the
+              # session reconciler (LOCAL_ENDPOINT=$(NODE_NAME)) processes these sessions.
               kubectl apply -f - <<EOF
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
@@ -134,7 +136,7 @@ spec:
     - name: assert-sessions-established
       try:
         # Each BGPSession should reach Established state.
-        # We assert via sessionState field on all sessions owned by the policy.
+        # Filter by the policy label to avoid counting sessions from other tests.
         - script:
             content: |
               set -e
@@ -143,6 +145,7 @@ spec:
               ATTEMPTS=0
               while [ "$ESTABLISHED" -lt 3 ] && [ "$ATTEMPTS" -lt 60 ]; do
                 ESTABLISHED=$(kubectl get bgpsessions \
+                  -l bgp.miloapis.com/policy=e2e-mesh \
                   -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
                   | grep -c "^Established$" || true)
                 ATTEMPTS=$((ATTEMPTS+1))
@@ -150,7 +153,7 @@ spec:
               done
               if [ "$ESTABLISHED" -lt 3 ]; then
                 echo "ERROR: only $ESTABLISHED/3 sessions reached Established"
-                kubectl get bgpsessions -o wide
+                kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh -o wide
                 exit 1
               fi
               echo "OK: $ESTABLISHED/3 sessions are Established"
@@ -190,7 +193,8 @@ spec:
               ATTEMPTS=0
               COUNT=1
               while [ "$COUNT" -gt 0 ] && [ "$ATTEMPTS" -lt 30 ]; do
-                COUNT=$(kubectl get bgpsessions --no-headers 2>/dev/null | wc -l || echo 0)
+                COUNT=$(kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh \
+                  --no-headers 2>/dev/null | wc -l || echo 0)
                 ATTEMPTS=$((ATTEMPTS+1))
                 [ "$COUNT" -gt 0 ] && sleep 5
               done

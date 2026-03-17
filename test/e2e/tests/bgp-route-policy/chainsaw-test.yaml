@@ -21,11 +21,13 @@ spec:
               W1=$(get_ipv6 bgp-e2e-worker)
               W2=$(get_ipv6 bgp-e2e-worker2)
 
+              # Endpoint names must exactly match the kind worker node names so that the
+              # session reconciler (LOCAL_ENDPOINT=$(NODE_NAME)) processes these sessions.
               kubectl apply -f - <<EOF
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
               metadata:
-                name: bgp-e2e-worker-rp
+                name: bgp-e2e-worker
                 labels:
                   e2e-test: bgp-route-policy
               spec:
@@ -38,7 +40,7 @@ spec:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
               metadata:
-                name: bgp-e2e-worker2-rp
+                name: bgp-e2e-worker2
                 labels:
                   e2e-test: bgp-route-policy
               spec:
@@ -70,6 +72,7 @@ spec:
               ATTEMPTS=0
               while [ "$ATTEMPTS" -lt 60 ]; do
                 STATE=$(kubectl get bgpsessions \
+                  -l bgp.miloapis.com/policy=e2e-rp-mesh \
                   -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
                   | grep -c "^Established$" || true)
                 [ "$STATE" -ge 1 ] && break
@@ -143,9 +146,9 @@ spec:
             ref:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
-              name: bgp-e2e-worker-rp
+              name: bgp-e2e-worker
         - delete:
             ref:
               apiVersion: bgp.miloapis.com/v1alpha1
               kind: BGPEndpoint
-              name: bgp-e2e-worker2-rp
+              name: bgp-e2e-worker2
