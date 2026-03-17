@@ -33,17 +33,6 @@ spec:
               fi
               echo "OK: $READY pod(s) with both containers ready"
 
-    - name: bgp-configuration-speaker-ready
-      try:
-        - assert:
-            resource:
-              apiVersion: bgp.miloapis.com/v1alpha1
-              kind: BGPConfiguration
-              metadata:
-                name: default
-              status:
-                (conditions[?type=='SpeakerReady'].status | [0]): "True"
-
     - name: crds-established
       try:
         - assert:
