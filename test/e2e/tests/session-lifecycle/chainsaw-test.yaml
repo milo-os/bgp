@@ -10,9 +10,6 @@ spec:
     - name: create-endpoints-and-manual-session
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               get_ipv6() {
@@ -87,9 +84,6 @@ spec:
     - name: verify-gobgp-peer-present
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               # Get the worker2 bgp pod (it owns the local endpoint)
@@ -113,9 +107,6 @@ spec:
               kind: BGPSession
               name: e2e-manual-session-w2-w3
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               W3=$(kubectl get node bgp-e2e-worker3 \

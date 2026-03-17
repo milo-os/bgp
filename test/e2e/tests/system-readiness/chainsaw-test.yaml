@@ -21,9 +21,6 @@ spec:
       try:
         # Each pod runs bgp + gobgpd — verify at least one pod has both containers ready.
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               READY=$(kubectl -n bgp-system get pods \

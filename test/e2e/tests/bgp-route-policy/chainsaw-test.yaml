@@ -11,9 +11,6 @@ spec:
     - name: setup-endpoints-and-peering
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               get_ipv6() {
@@ -68,9 +65,6 @@ spec:
     - name: wait-for-session-established
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               ATTEMPTS=0
@@ -122,9 +116,6 @@ spec:
     - name: assert-no-error-condition
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               # If the operator sets any error condition the test fails.

@@ -13,9 +13,6 @@ spec:
         # subsequent steps can reference them as endpoint addresses. kind worker
         # nodes are named bgp-e2e-worker, bgp-e2e-worker2, bgp-e2e-worker3.
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               get_ipv6() {
@@ -38,9 +35,6 @@ spec:
     - name: create-bgp-endpoints
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               get_ipv6() {
@@ -142,9 +136,6 @@ spec:
         # Each BGPSession should reach Established state.
         # We assert via sessionState field on all sessions owned by the policy.
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               # Wait up to 5 minutes (chainsaw assert timeout) for all sessions
@@ -194,9 +185,6 @@ spec:
     - name: assert-sessions-cleaned-up
       try:
         - script:
-            env:
-              - name: KUBECONFIG
-                value: ($env.KUBECONFIG)
             content: |
               set -e
               ATTEMPTS=0
