@@ -57,7 +57,12 @@ spec:
             - name: LOCAL_ENDPOINT
               value: ""  # Must be set by overlay (e.g., "node-$(NODE_NAME)")
           securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
             capabilities:
+              drop:
+                - ALL
               add:
                 - NET_ADMIN
           livenessProbe:
