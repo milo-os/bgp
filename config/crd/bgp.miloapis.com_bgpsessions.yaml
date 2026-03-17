@@ -23,12 +23,12 @@ spec:
     - jsonPath: .spec.remoteEndpoint
       name: Remote
       type: string
-    - jsonPath: .status.sessionState
-      name: Session
+    - jsonPath: .status.conditions[?(@.type=="Configured")].status
+      name: Configured
       type: string
-    - jsonPath: .status.receivedPrefixes
-      name: RX Prefixes
-      type: integer
+    - jsonPath: .status.conditions[?(@.type=="SessionEstablished")].status
+      name: Established
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -58,6 +58,38 @@ spec:
             description: BGPSessionSpec declares a peering relationship between two
               BGPEndpoints.
             properties:
+              ebgpConfig:
+                description: |-
+                  EBGPConfig holds eBGP-specific session parameters.
+                  Only meaningful when the local and remote endpoints have different AS numbers.
+                properties:
+                  multiHop:
+                    description: MultiHop enables eBGP multi-hop when the peers are
+                      not directly connected.
+                    properties:
+                      ttl:
+                        description: TTL is the maximum number of hops permitted (1–255).
+                        format: int32
+                        maximum: 255
+                        minimum: 1
+                        type: integer
+                    required:
+                    - ttl
+                    type: object
+                  ttlSecurity:
+                    description: TTLSecurity enables GTSM for this eBGP session.
+                    properties:
+                      ttl:
+                        description: TTL is the expected minimum TTL for incoming
+                          eBGP packets.
+                        format: int32
+                        maximum: 255
+                        minimum: 1
+                        type: integer
+                    required:
+                    - ttl
+                    type: object
+                type: object
               holdTime:
                 default: 90
                 description: HoldTime is the BGP hold time in seconds. Defaults to
@@ -81,7 +113,7 @@ spec:
               routeReflector:
                 description: |-
                   RouteReflector configures this session for route reflector client behavior.
-                  Phase 2 stub.
+                  When set, the local speaker treats the remote peer as a route reflector client.
                 properties:
                   clusterID:
                     description: ClusterID is the route reflector cluster ID.
@@ -94,13 +126,12 @@ spec:
             - remoteEndpoint
             type: object
           status:
-            description: BGPSessionStatus reflects the observed BGP session state.
+            description: |-
+              BGPSessionStatus reflects the observed BGP session state.
+              Operational counters (session state, received/advertised prefixes, flap count)
+              are exposed as Prometheus metrics rather than CRD status fields to avoid
+              high-frequency status writes from polling loops.
             properties:
-              advertisedPrefixes:
-                description: AdvertisedPrefixes is the count of prefixes advertised
-                  to the remote peer.
-                format: int64
-                type: integer
               conditions:
                 description: Conditions describe the current state of the session.
                 items:
@@ -161,26 +192,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              flapCount:
-                description: |-
-                  FlapCount is the number of times this session has gone from Established
-                  to a non-Established state.
-                format: int64
-                type: integer
-              lastTransitionTime:
-                description: LastTransitionTime is when the session state last changed.
-                format: date-time
-                type: string
-              receivedPrefixes:
-                description: ReceivedPrefixes is the count of prefixes received from
-                  the remote peer.
-                format: int64
-                type: integer
-              sessionState:
-                description: |-
-                  SessionState is the current BGP FSM state as reported by GoBGP.
-                  One of: Unknown, Idle, Connect, Active, OpenSent, OpenConfirm, Established.
-                type: string
             type: object
         required:
         - spec
