@@ -93,34 +93,15 @@ type BGPSessionSpec struct {
 }
 
 // BGPSessionStatus reflects the observed BGP session state.
+// Operational counters (session state, received/advertised prefixes, flap count)
+// are exposed as Prometheus metrics rather than CRD status fields to avoid
+// high-frequency status writes from polling loops.
 type BGPSessionStatus struct {
-	// SessionState is the current BGP FSM state as reported by GoBGP.
-	// One of: Unknown, Idle, Connect, Active, OpenSent, OpenConfirm, Established.
-	// +optional
-	SessionState string `json:"sessionState,omitempty"`
-
 	// Conditions describe the current state of the session.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	// ReceivedPrefixes is the count of prefixes received from the remote peer.
-	// +optional
-	ReceivedPrefixes int64 `json:"receivedPrefixes,omitempty"`
-
-	// AdvertisedPrefixes is the count of prefixes advertised to the remote peer.
-	// +optional
-	AdvertisedPrefixes int64 `json:"advertisedPrefixes,omitempty"`
-
-	// LastTransitionTime is when the session state last changed.
-	// +optional
-	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
-
-	// FlapCount is the number of times this session has gone from Established
-	// to a non-Established state.
-	// +optional
-	FlapCount int64 `json:"flapCount,omitempty"`
 }
 
 // Condition types for BGPSession.
@@ -137,8 +118,8 @@ const (
 // +kubebuilder:resource:scope=Cluster,shortName=bgpsess
 // +kubebuilder:printcolumn:name="Local",type=string,JSONPath=`.spec.localEndpoint`
 // +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.spec.remoteEndpoint`
-// +kubebuilder:printcolumn:name="Session",type=string,JSONPath=`.status.sessionState`
-// +kubebuilder:printcolumn:name="RX Prefixes",type=integer,JSONPath=`.status.receivedPrefixes`
+// +kubebuilder:printcolumn:name="Configured",type=string,JSONPath=`.status.conditions[?(@.type=="Configured")].status`
+// +kubebuilder:printcolumn:name="Established",type=string,JSONPath=`.status.conditions[?(@.type=="SessionEstablished")].status`
 
 // BGPSession declares a BGP peering relationship between two BGPEndpoints.
 // Sessions are created by BGPPeeringPolicy controllers or manually by platform operators.
