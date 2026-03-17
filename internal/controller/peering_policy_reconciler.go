@@ -38,6 +38,8 @@ type PeeringPolicyReconciler struct {
 // For "mesh" mode, it creates a BGPSession for every unique pair of matching endpoints
 // and removes sessions that no longer correspond to a valid pair.
 func (r *PeeringPolicyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	log.Printf("bgp/policy: Reconcile %s", req.Name)
+
 	var policy bgpv1alpha1.BGPPeeringPolicy
 	if err := r.Get(ctx, req.NamespacedName, &policy); err != nil {
 		if client.IgnoreNotFound(err) != nil {
