@@ -73,8 +73,8 @@ spec:
               while [ "$ATTEMPTS" -lt 60 ]; do
                 STATE=$(kubectl get bgpsessions \
                   -l bgp.miloapis.com/policy=e2e-rp-mesh \
-                  -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
-                  | grep -c "^Established$" || true)
+                  -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="SessionEstablished")].status}{"\n"}{end}' \
+                  | grep -c "^True$" || true)
                 [ "$STATE" -ge 1 ] && break
                 ATTEMPTS=$((ATTEMPTS+1))
                 sleep 5
