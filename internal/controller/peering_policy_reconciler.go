@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"sort"
@@ -12,8 +14,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -24,14 +28,16 @@ import (
 // BGPEndpoint objects and creating BGPSession resources for every pair (mesh mode).
 // It also watches BGPEndpoint events to re-reconcile policies when endpoints change.
 //
-// Because the operator runs as a DaemonSet, multiple pods reconcile the same
-// BGPPeeringPolicy resources concurrently. This is safe because:
-//   - Session creation uses errors.IsAlreadyExists to handle concurrent creates.
-//   - Session GC only deletes sessions whose names are not in the computed desired
-//     set, and all pods compute identical desired sets from the same policy spec.
-//   - Status patches may conflict; conflicts cause a requeue and eventual convergence.
+// The reconciler uses a "designated reconciler" pattern: only the pod whose
+// LocalEndpoint sorts first alphabetically among all live BGPEndpoints performs
+// the actual reconciliation. All other pods skip and return immediately. This
+// avoids concurrent session GC races while remaining stateless (no Kubernetes
+// leader election lease required).
 type PeeringPolicyReconciler struct {
 	client.Client
+	// LocalEndpoint is the name of the BGPEndpoint resource representing this pod.
+	// Used to determine whether this pod is the designated reconciler.
+	LocalEndpoint string
 }
 
 // Reconcile handles BGPPeeringPolicy events.
@@ -50,6 +56,29 @@ func (r *PeeringPolicyReconciler) Reconcile(ctx context.Context, req reconcile.R
 	}
 
 	if policy.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+
+	// Designated-reconciler guard: list all BGPEndpoints and check if this pod's
+	// endpoint sorts first. Only the designated pod performs mutation; others skip.
+	// This prevents concurrent GC from all pods racing to delete sessions.
+	var allEndpoints bgpv1alpha1.BGPEndpointList
+	if err := r.List(ctx, &allEndpoints); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list BGPEndpoints for leader check: %w", err)
+	}
+	if len(allEndpoints.Items) == 0 {
+		// No endpoints yet — retry quickly so we don't miss the first endpoint.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	firstEndpoint := allEndpoints.Items[0].Name
+	for _, ep := range allEndpoints.Items[1:] {
+		if ep.Name < firstEndpoint {
+			firstEndpoint = ep.Name
+		}
+	}
+	if r.LocalEndpoint != firstEndpoint {
+		log.Printf("bgp/policy: %s: not designated (local=%s first=%s) — skipping",
+			req.Name, r.LocalEndpoint, firstEndpoint)
 		return ctrl.Result{}, nil
 	}
 
@@ -119,7 +148,7 @@ func (r *PeeringPolicyReconciler) Reconcile(ctx context.Context, req reconcile.R
 	}
 
 	var ownedList bgpv1alpha1.BGPSessionList
-	if err := r.List(ctx, &ownedList); err != nil {
+	if err := r.List(ctx, &ownedList, client.MatchingLabels{"bgp.miloapis.com/policy": policy.Name}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list BGPSessions: %w", err)
 	}
 
@@ -163,8 +192,9 @@ func (r *PeeringPolicyReconciler) Reconcile(ctx context.Context, req reconcile.R
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Periodic requeue to pick up any missed endpoint label changes.
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	// No periodic requeue needed — the BGPEndpoint and BGPSession watches trigger
+	// re-reconciliation whenever relevant objects change.
+	return ctrl.Result{}, nil
 }
 
 // computeDesiredSessions returns the set of BGPSession objects that should exist
@@ -200,7 +230,7 @@ func (r *PeeringPolicyReconciler) computeMeshSessions(
 		for j := i + 1; j < len(sorted); j++ {
 			a := sorted[i].Name
 			b := sorted[j].Name
-			sessionName := "session-" + a + "-" + b
+			sessionName := sessionNameForPair(a, b)
 
 			sess := r.buildSession(policy, sessionName, a, b, nil)
 			sessions = append(sessions, sess)
@@ -259,13 +289,25 @@ func (r *PeeringPolicyReconciler) computeRRSessions(
 		if a > b {
 			a, b = b, a
 		}
-		sessionName := "session-" + a + "-" + b
+		sessionName := sessionNameForPair(a, b)
 
 		sess := r.buildSession(policy, sessionName, rr.Name, ep.Name, rrConfig)
 		sessions = append(sessions, sess)
 	}
 
 	return sessions, nil
+}
+
+// sessionNameForPair returns a deterministic BGPSession name for an (a, b) endpoint pair
+// where a < b alphabetically. If the canonical "session-a-b" name exceeds 253 characters
+// (the Kubernetes name length limit), a stable SHA-256-based short name is used instead.
+func sessionNameForPair(a, b string) string {
+	name := "session-" + a + "-" + b
+	if len(name) <= 253 {
+		return name
+	}
+	h := sha256.Sum256([]byte(a + "-" + b))
+	return "session-" + hex.EncodeToString(h[:8])
 }
 
 // buildSession constructs a BGPSession owned by the policy.
@@ -378,5 +420,8 @@ func (r *PeeringPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&bgpv1alpha1.BGPSession{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSessionToPolicies),
 		).
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 30*time.Second),
+		}).
 		Complete(r)
 }

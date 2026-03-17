@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"google.golang.org/grpc/codes"
@@ -12,8 +13,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -263,6 +266,8 @@ func (r *RoutePolicyReconciler) upsertPolicy(ctx context.Context, c gobgpapi.Gob
 
 // resolvePeerAddresses returns the remote endpoint addresses for sessions matching
 // the policy's peerSelector. Returns nil when peerSelector is nil (global assignment).
+// It lists all BGPEndpoints once and builds a name→address map to avoid N individual
+// Get calls — one List instead of one Get per matched session.
 func (r *RoutePolicyReconciler) resolvePeerAddresses(ctx context.Context, policy *bgpv1alpha1.BGPRoutePolicy) ([]string, error) {
 	if policy.Spec.PeerSelector == nil {
 		return nil, nil
@@ -278,19 +283,35 @@ func (r *RoutePolicyReconciler) resolvePeerAddresses(ctx context.Context, policy
 		return nil, fmt.Errorf("list BGPSessions: %w", err)
 	}
 
-	addresses := make([]string, 0, len(sessionList.Items))
+	// Collect the unique remote endpoint names referenced by matching sessions.
+	remoteEndpointNames := make(map[string]struct{})
 	for _, sess := range sessionList.Items {
-		if !sel.Matches(labels.Set(sess.Labels)) {
-			continue
+		if sel.Matches(labels.Set(sess.Labels)) {
+			remoteEndpointNames[sess.Spec.RemoteEndpoint] = struct{}{}
 		}
+	}
+	if len(remoteEndpointNames) == 0 {
+		return nil, nil
+	}
 
-		// Resolve the remote endpoint address.
-		var remoteEP bgpv1alpha1.BGPEndpoint
-		if err := r.Get(ctx, types.NamespacedName{Name: sess.Spec.RemoteEndpoint}, &remoteEP); err != nil {
-			log.Printf("bgp/routepolicy: get remote endpoint %s for session %s: %v", sess.Spec.RemoteEndpoint, sess.Name, err)
+	// List all BGPEndpoints once and build a name→address lookup map.
+	var endpointList bgpv1alpha1.BGPEndpointList
+	if err := r.List(ctx, &endpointList); err != nil {
+		return nil, fmt.Errorf("list BGPEndpoints: %w", err)
+	}
+	endpointAddrs := make(map[string]string, len(endpointList.Items))
+	for _, ep := range endpointList.Items {
+		endpointAddrs[ep.Name] = ep.Spec.Address
+	}
+
+	addresses := make([]string, 0, len(remoteEndpointNames))
+	for name := range remoteEndpointNames {
+		addr, ok := endpointAddrs[name]
+		if !ok {
+			log.Printf("bgp/routepolicy: remote endpoint %s not found in cache", name)
 			continue
 		}
-		addresses = append(addresses, remoteEP.Spec.Address)
+		addresses = append(addresses, addr)
 	}
 
 	return addresses, nil
@@ -423,6 +444,9 @@ func (r *RoutePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&bgpv1alpha1.BGPSession{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSessionToPolicies),
 		).
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 30*time.Second),
+		}).
 		Complete(r)
 }
 

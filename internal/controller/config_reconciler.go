@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"google.golang.org/grpc/codes"
@@ -13,9 +14,11 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -96,6 +99,13 @@ func (r *ConfigReconciler) Reconcile(ctx context.Context, req reconcile.Request)
 		}
 		log.Printf("bgp/config: started GoBGP AS=%d routerID=%s port=%d",
 			cfg.Spec.ASNumber, routerID, cfg.Spec.ListenPort)
+
+		// After a BGP restart, re-apply all sessions, advertisements, and policies
+		// so GoBGP recovers its state without waiting for external events.
+		log.Printf("bgp/config: triggering full re-reconciliation after GoBGP restart")
+		if err := r.GoBGP.FullReconcile(ctx, r.Client); err != nil {
+			log.Printf("bgp/config: full re-reconciliation after restart: %v", err)
+		}
 	}
 
 	// Update status.
@@ -185,5 +195,8 @@ func ipv6ToRouterID(ip net.IP) string {
 func (r *ConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&bgpv1alpha1.BGPConfiguration{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 30*time.Second),
+		}).
 		Complete(r)
 }

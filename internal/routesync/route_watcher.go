@@ -69,8 +69,27 @@ func RunRouteWatcher(ctx context.Context, gobgp *bgpcontroller.GoBGPClient, srv6
 
 // watchAndProgram opens a WatchEvent stream on GoBGP and programs netlink routes
 // until the stream ends or ctx is cancelled.
+//
+// On startup, it loads the existing proto-196 routes from the kernel into
+// knownPrefixes. After the initial RIB dump (paths with Init=true) arrives,
+// any kernel route not present in the RIB is considered stale (left over from
+// a previous operator lifetime) and is deleted.
 func watchAndProgram(ctx context.Context, client gobgpapi.GobgpApiClient, ownPrefix *net.IPNet) error {
-	knownPrefixes := make(map[string]net.IP)
+	// Seed knownPrefixes with all routes already in the kernel so stale routes
+	// left from a prior operator run can be identified after the initial RIB dump.
+	existingRoutes, err := bgpnetlink.ListManagedRoutes()
+	if err != nil {
+		log.Printf("bgp/route: list existing managed routes: %v", err)
+	}
+	knownPrefixes := make(map[string]net.IP, len(existingRoutes))
+	for _, r := range existingRoutes {
+		if r.Dst != nil {
+			knownPrefixes[r.Dst.String()] = r.Gw
+		}
+	}
+	if len(knownPrefixes) > 0 {
+		log.Printf("bgp/route: loaded %d existing managed routes for stale-GC", len(knownPrefixes))
+	}
 
 	stream, err := client.WatchEvent(ctx, &gobgpapi.WatchEventRequest{
 		Table: &gobgpapi.WatchEventRequest_Table{
@@ -85,6 +104,12 @@ func watchAndProgram(ctx context.Context, client gobgpapi.GobgpApiClient, ownPre
 	if err != nil {
 		return fmt.Errorf("WatchEvent: %w", err)
 	}
+
+	// ribInitPrefixes tracks prefixes seen during the initial RIB dump so we can
+	// garbage-collect kernel routes that are no longer in the RIB. Once GC has
+	// run once (after the first event message), initGCDone is set to true.
+	ribInitPrefixes := make(map[string]struct{})
+	initGCDone := false
 
 	for {
 		resp, err := stream.Recv()
@@ -120,6 +145,11 @@ func watchAndProgram(ctx context.Context, client gobgpapi.GobgpApiClient, ownPre
 				continue
 			}
 
+			if !initGCDone {
+				// Collect prefixes seen in the init dump for stale-GC comparison.
+				ribInitPrefixes[prefix.String()] = struct{}{}
+			}
+
 			if path.IsWithdraw {
 				log.Printf("bgp/route: DEL route %s", prefix)
 				if err := bgpnetlink.DelRoute(prefix); err != nil {
@@ -132,6 +162,27 @@ func watchAndProgram(ctx context.Context, client gobgpapi.GobgpApiClient, ownPre
 					log.Printf("bgp/route: add route %s via %s: %v", prefix, nextHop, err)
 				}
 				knownPrefixes[prefix.String()] = nextHop
+			}
+		}
+
+		// After processing the first event message (which contains the full initial
+		// RIB dump from GoBGP when Init=true), garbage-collect any kernel routes
+		// that were not present in the RIB. These are stale routes from a previous
+		// operator lifetime.
+		if !initGCDone {
+			initGCDone = true
+			for prefix, gw := range knownPrefixes {
+				if _, inRIB := ribInitPrefixes[prefix]; !inRIB {
+					_, pfxNet, parseErr := net.ParseCIDR(prefix)
+					if parseErr != nil {
+						continue
+					}
+					log.Printf("bgp/route: GC stale route %s (gw=%s) — not in RIB after init", prefix, gw)
+					if delErr := bgpnetlink.DelRoute(pfxNet); delErr != nil {
+						log.Printf("bgp/route: GC del route %s: %v", prefix, delErr)
+					}
+					delete(knownPrefixes, prefix)
+				}
 			}
 		}
 	}

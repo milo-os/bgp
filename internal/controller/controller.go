@@ -58,10 +58,9 @@ func init() {
 //     RoutePolicyReconciler: node-local — each pod only acts on resources
 //     that reference its own LocalEndpoint.
 //
-//   - PeeringPolicyReconciler: runs on all pods concurrently. Session
-//     creation is idempotent (AlreadyExists is handled gracefully) and all
-//     pods compute identical desired session sets, making concurrent
-//     reconciliation safe without leader election.
+//   - PeeringPolicyReconciler: uses a designated-reconciler pattern. Only the
+//     pod whose LocalEndpoint sorts first alphabetically among all live
+//     BGPEndpoints performs session create/GC. Other pods skip immediately.
 func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx context.Context, gobgp *GoBGPClient, srv6Net string)) error {
 	if opts.GoBGPAddr == "" {
 		opts.GoBGPAddr = gobgpDefaultAddr
@@ -132,11 +131,12 @@ func Run(ctx context.Context, opts ControllerOptions, routeWatcher func(ctx cont
 	}
 
 	// BGPPeeringPolicy: creates/deletes BGPSession objects for matching endpoint
-	// pairs. All DaemonSet pods run this reconciler; concurrent creates and GC
-	// are safe because create uses AlreadyExists handling and all pods compute
-	// identical desired session sets from the same policy spec.
+	// pairs. Uses a designated-reconciler pattern: only the pod whose LocalEndpoint
+	// sorts first alphabetically among all BGPEndpoints performs mutation. This
+	// avoids concurrent GC races while remaining stateless.
 	if err := (&PeeringPolicyReconciler{
-		Client: mgr.GetClient(),
+		Client:        mgr.GetClient(),
+		LocalEndpoint: opts.LocalEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup BGPPeeringPolicy reconciler: %w", err)
 	}

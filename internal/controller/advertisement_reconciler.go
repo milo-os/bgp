@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 
 	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -13,8 +14,10 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -301,6 +304,9 @@ func (r *AdvertisementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&bgpv1alpha1.BGPSession{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSessionToAdvertisements),
 		).
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 30*time.Second),
+		}).
 		Complete(r)
 }
 

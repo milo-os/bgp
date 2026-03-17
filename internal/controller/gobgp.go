@@ -226,50 +226,12 @@ func (g *GoBGPClient) FullReconcile(ctx context.Context, k8sClient client.Client
 
 	log.Printf("bgp: full re-reconciliation complete (%d/%d sessions applied)", applied, len(sessionList.Items))
 
-	// Re-trigger all BGPAdvertisement reconcilers by bumping a reconcile-trigger annotation.
-	// This causes the AdvertisementReconciler to re-inject all prefixes into the fresh GoBGP.
-	var advList bgpv1alpha1.BGPAdvertisementList
-	if err := k8sClient.List(ctx, &advList); err != nil {
-		log.Printf("bgp: full re-reconcile: list BGPAdvertisements: %v", err)
-	} else {
-		for i := range advList.Items {
-			adv := &advList.Items[i]
-			if adv.DeletionTimestamp != nil {
-				continue
-			}
-			patch := client.MergeFrom(adv.DeepCopy())
-			if adv.Annotations == nil {
-				adv.Annotations = make(map[string]string)
-			}
-			adv.Annotations["bgp.miloapis.com/reconcile-trigger"] = fmt.Sprintf("%d", adv.Generation)
-			if err := k8sClient.Patch(ctx, adv, patch); err != nil {
-				log.Printf("bgp: re-trigger BGPAdvertisement %s: %v", adv.Name, err)
-			}
-		}
-		log.Printf("bgp: triggered re-reconciliation for %d BGPAdvertisement(s)", len(advList.Items))
-	}
-
-	// Re-trigger all BGPRoutePolicy reconcilers similarly.
-	var policyList bgpv1alpha1.BGPRoutePolicyList
-	if err := k8sClient.List(ctx, &policyList); err != nil {
-		log.Printf("bgp: full re-reconcile: list BGPRoutePolicies: %v", err)
-	} else {
-		for i := range policyList.Items {
-			pol := &policyList.Items[i]
-			if pol.DeletionTimestamp != nil {
-				continue
-			}
-			patch := client.MergeFrom(pol.DeepCopy())
-			if pol.Annotations == nil {
-				pol.Annotations = make(map[string]string)
-			}
-			pol.Annotations["bgp.miloapis.com/reconcile-trigger"] = fmt.Sprintf("%d", pol.Generation)
-			if err := k8sClient.Patch(ctx, pol, patch); err != nil {
-				log.Printf("bgp: re-trigger BGPRoutePolicy %s: %v", pol.Name, err)
-			}
-		}
-		log.Printf("bgp: triggered re-reconciliation for %d BGPRoutePolicy(s)", len(policyList.Items))
-	}
+	// BGPAdvertisement and BGPRoutePolicy resources are re-applied via the normal
+	// reconcile path. The AdvertisementReconciler and RoutePolicyReconciler watch
+	// their respective resources and will re-reconcile them after GoBGP reconnects
+	// because returning an error from any reconciler causes a requeue. The
+	// reconnectCh signal (closed in WatchHealth) can also be used by callers to
+	// trigger explicit re-reconciliation if needed.
 
 	return nil
 }

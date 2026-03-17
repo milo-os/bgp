@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -24,9 +27,10 @@ const (
 	// GoBGP DeletePeer is called before the resource is removed from etcd.
 	SessionFinalizer = "bgp.miloapis.com/session-cleanup"
 
-	// sessionRequeueInterval is how often the reconciler re-checks the live peer
-	// state in GoBGP and refreshes the SessionEstablished condition and metrics.
-	sessionRequeueInterval = 30 * time.Second
+	// sessionNotEstablishedRequeue is how long to wait before re-checking peer
+	// state when a session is not yet Established. Once Established, no requeue
+	// is needed — BGPEndpoint and BGPSession watches drive re-reconciliation.
+	sessionNotEstablishedRequeue = 10 * time.Second
 )
 
 // SessionReconciler reconciles BGPSession resources into GoBGP AddPeer/DeletePeer calls.
@@ -36,6 +40,13 @@ type SessionReconciler struct {
 	client.Client
 	GoBGP         *GoBGPClient
 	LocalEndpoint string
+
+	// lastGoBGPAddr is an in-memory cache of the last GoBGP peer address used per
+	// session. Key is session name; value is the remote endpoint address last applied
+	// to GoBGP. This replaces the per-node annotation pattern, eliminating two API
+	// calls per reconcile (Patch + re-Get).
+	lastGoBGPAddrMu sync.RWMutex
+	lastGoBGPAddr   map[string]string
 }
 
 // Reconcile ensures the GoBGP peer state matches the BGPSession spec.
@@ -111,10 +122,11 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Detect remote address change using a per-node annotation so each node tracks
-	// its own GoBGP peer address independently.
-	lastAddrAnnotation := "bgp.miloapis.com/last-gobgp-address-" + r.LocalEndpoint
-	lastAddr, hasLastAddr := session.Annotations[lastAddrAnnotation]
+	// Detect remote address change using the in-memory last-address cache.
+	// This avoids annotation Patch + re-Get API calls on every reconcile.
+	r.lastGoBGPAddrMu.RLock()
+	lastAddr, hasLastAddr := r.lastGoBGPAddr[session.Name]
+	r.lastGoBGPAddrMu.RUnlock()
 	if hasLastAddr && lastAddr != remoteEP.Spec.Address {
 		log.Printf("bgp/session: %s remote address changed from %s to %s — deleting old peer",
 			session.Name, lastAddr, remoteEP.Spec.Address)
@@ -129,25 +141,22 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return r.setConfiguredFalse(ctx, &session, fmt.Sprintf("GoBGP error: %v", err))
 	}
 
-	// Record the last known remote address for change detection.
-	patch := client.MergeFrom(session.DeepCopy())
-	if session.Annotations == nil {
-		session.Annotations = make(map[string]string)
+	// Record the last known remote address in-memory for change detection on future reconciles.
+	r.lastGoBGPAddrMu.Lock()
+	if r.lastGoBGPAddr == nil {
+		r.lastGoBGPAddr = make(map[string]string)
 	}
-	session.Annotations[lastAddrAnnotation] = remoteEP.Spec.Address
-	if err := r.Patch(ctx, &session, patch); err != nil {
-		log.Printf("bgp/session: patch annotations: %v", err)
-	}
-
-	// Re-read after annotation patch to get the latest resource version.
-	if err := r.Get(ctx, req.NamespacedName, &session); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
+	r.lastGoBGPAddr[session.Name] = remoteEP.Spec.Address
+	r.lastGoBGPAddrMu.Unlock()
 
 	// Query the live peer state from GoBGP and update both the SessionEstablished
-	// condition and Prometheus metrics. This replaces the old polling goroutine:
-	// state is refreshed on every reconcile plus on the 30-second RequeueAfter.
+	// condition and Prometheus metrics.
 	sessionState, isEstablished, rxPrefixes := r.queryPeerState(ctx, c, remoteEP.Spec.Address)
+
+	// Save the previous established state BEFORE mutating conditions so flap
+	// detection compares the old persisted state against the new observed state.
+	prevEstablished := apimeta.FindStatusCondition(session.Status.Conditions, bgpv1alpha1.BGPSessionEstablished)
+	wasEstablished := prevEstablished != nil && prevEstablished.Status == metav1.ConditionTrue
 
 	// Build the full status patch: Configured=True + SessionEstablished.
 	statusPatch := client.MergeFrom(session.DeepCopy())
@@ -175,23 +184,24 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return ctrl.Result{}, fmt.Errorf("patch session status: %w", err)
 	}
 
-	// Emit Prometheus metrics. Flap detection is handled by comparing the
-	// previous condition status: if the condition just transitioned from True
-	// to False this reconcile, record a flap.
+	// Emit Prometheus metrics. Flap detection uses the saved pre-mutation state
+	// so we correctly detect a True→False transition this reconcile cycle.
 	RecordSessionState(session.Name, sessionState)
 	RecordReceivedPrefixes(session.Name, rxPrefixes)
 
-	prevEstablished := apimeta.FindStatusCondition(session.Status.Conditions, bgpv1alpha1.BGPSessionEstablished)
-	if prevEstablished != nil && prevEstablished.Status == metav1.ConditionTrue && !isEstablished {
+	if wasEstablished && !isEstablished {
 		RecordSessionFlap(session.Name)
 	}
 
 	log.Printf("bgp/session: reconciled %s (local=%s remote=%s state=%s)",
 		session.Name, localEP.Spec.Address, remoteEP.Spec.Address, sessionState)
 
-	// Requeue after 30 seconds to refresh the SessionEstablished condition
-	// and metrics without a dedicated polling goroutine.
-	return ctrl.Result{RequeueAfter: sessionRequeueInterval}, nil
+	// Only requeue when not yet Established to poll for convergence.
+	// Once Established, the BGPEndpoint and BGPSession watches drive re-reconciliation.
+	if !isEstablished {
+		return ctrl.Result{RequeueAfter: sessionNotEstablishedRequeue}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // queryPeerState performs a one-shot ListPeer for the given neighbor address
@@ -200,7 +210,7 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req reconcile.Request
 func (r *SessionReconciler) queryPeerState(ctx context.Context, c gobgpapi.GobgpApiClient, neighborAddr string) (state string, isEstablished bool, rxPrefixes int64) {
 	stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{
 		Address:          neighborAddr,
-		EnableAdvertised: true,
+		EnableAdvertised: false,
 	})
 	if err != nil {
 		log.Printf("bgp/session: ListPeer %s: %v", neighborAddr, err)
@@ -260,13 +270,11 @@ func (r *SessionReconciler) handleDelete(ctx context.Context, c gobgpapi.GobgpAp
 		return nil
 	}
 
-	// Determine the address GoBGP knows this peer by.
-	// Use the per-node last-known address annotation if available (covers endpoint rename/change).
-	addr := ""
-	nodeAnnotationKey := "bgp.miloapis.com/last-gobgp-address-" + r.LocalEndpoint
-	if last, ok := session.Annotations[nodeAnnotationKey]; ok && last != "" {
-		addr = last
-	}
+	// Use the in-memory last-address cache to find the address GoBGP knows this peer by.
+	// This covers endpoint address changes that happened between reconciles.
+	r.lastGoBGPAddrMu.RLock()
+	addr := r.lastGoBGPAddr[session.Name]
+	r.lastGoBGPAddrMu.RUnlock()
 
 	if addr != "" {
 		if _, err := c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr}); err != nil && !isNotFound(err) {
@@ -274,6 +282,11 @@ func (r *SessionReconciler) handleDelete(ctx context.Context, c gobgpapi.GobgpAp
 		}
 		log.Printf("bgp/session: deleted GoBGP peer %s (session=%s)", addr, session.Name)
 	}
+
+	// Clean up the in-memory cache entry.
+	r.lastGoBGPAddrMu.Lock()
+	delete(r.lastGoBGPAddr, session.Name)
+	r.lastGoBGPAddrMu.Unlock()
 
 	patch := client.MergeFrom(session.DeepCopy())
 	controllerutil.RemoveFinalizer(session, SessionFinalizer)
@@ -318,5 +331,8 @@ func (r *SessionReconciler) setConfiguredFalse(ctx context.Context, session *bgp
 func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&bgpv1alpha1.BGPSession{}).
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 30*time.Second),
+		}).
 		Complete(r)
 }
