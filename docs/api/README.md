@@ -151,7 +151,7 @@ kubectl get bgpsessions
 kubectl get bgpsess        # short name
 ```
 
-Printed columns: `Local`, `Remote`, `Session`, `RX Prefixes`
+Printed columns: `Local`, `Remote`, `Configured`, `Established`
 
 ### Spec
 
@@ -193,19 +193,25 @@ Printed columns: `Local`, `Remote`, `Session`, `RX Prefixes`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `sessionState` | `string` | Current BGP FSM state as reported by GoBGP, polled every 10 seconds. One of: `Unknown`, `Idle`, `Connect`, `Active`, `OpenSent`, `OpenConfirm`, `Established`. |
 | `conditions` | `[]metav1.Condition` | Current state of the session. See [Conditions](#bgpsession-conditions). |
-| `receivedPrefixes` | `int64` | Count of prefixes currently received from the remote peer (across all address families). |
-| `advertisedPrefixes` | `int64` | Count of prefixes currently advertised to the remote peer. |
-| `lastTransitionTime` | `metav1.Time` | Timestamp of the most recent session state change. |
-| `flapCount` | `int64` | Number of times this session has transitioned from `Established` to any other state. |
+
+Operational counters (session FSM state, received/advertised prefix counts, flap count) are
+exposed as Prometheus metrics rather than CRD status fields. This avoids high-frequency status
+writes from polling loops and eliminates multi-writer races in DaemonSet deployments.
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `bgp_session_state` | `session`, `state` | 1 for the active FSM state, 0 for all others. |
+| `bgp_received_prefixes_total` | `session` | Prefixes received from the remote peer. |
+| `bgp_advertised_prefixes_total` | `advertisement` | Prefixes advertised per BGPAdvertisement. |
+| `bgp_session_flaps_total` | `session` | Times this session left Established state. |
 
 #### BGPSession Conditions
 
 | Type | Meaning |
 |------|---------|
-| `SessionEstablished` | `True` when the BGP FSM is in `Established` state. `False` in all other states. |
 | `Configured` | `True` when the session has been successfully added to GoBGP via `AddPeer`/`UpdatePeer`. |
+| `SessionEstablished` | `True` when the BGP FSM is in `Established` state, refreshed every 30 seconds. `False` in all other states. |
 
 ### Examples
 
@@ -504,14 +510,18 @@ After applying resources, verify the BGP controller has reconciled them:
 # Check speaker is ready
 kubectl get bgpconfig default -o jsonpath='{.status.conditions[?(@.type=="SpeakerReady")].status}'
 
-# Check all sessions
+# Check all sessions — Configured and Established columns show condition status
 kubectl get bgpsessions -o wide
 
-# Watch session state changes
+# Watch session condition changes
 kubectl get bgpsessions -w
 
-# Check a specific session's full status
-kubectl get bgpsession node-a--node-b -o yaml | grep -A 20 status:
+# Check whether a specific session is established
+kubectl get bgpsession node-a--node-b \
+  -o jsonpath='{.status.conditions[?(@.type=="SessionEstablished")].status}'
+
+# Operational counters are in Prometheus metrics (session state, prefix counts, flaps)
+# Scrape the metrics endpoint on :8082 or use your observability stack.
 
 # Check peering policy created the expected sessions
 kubectl get bgppp us-east-mesh -o jsonpath='{.status}'

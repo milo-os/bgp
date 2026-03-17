@@ -179,7 +179,7 @@ spec:
 
     - name: assert-sessions-established
       try:
-        # Each BGPSession should reach Established state.
+        # Each BGPSession should have SessionEstablished condition=True.
         # Filter by the policy label to avoid counting sessions from other tests.
         - script:
             content: |
@@ -190,17 +190,17 @@ spec:
               while [ "$ESTABLISHED" -lt 3 ] && [ "$ATTEMPTS" -lt 60 ]; do
                 ESTABLISHED=$(kubectl get bgpsessions \
                   -l bgp.miloapis.com/policy=e2e-mesh \
-                  -o jsonpath='{range .items[*]}{.status.sessionState}{"\n"}{end}' \
-                  | grep -c "^Established$" || true)
+                  -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="SessionEstablished")].status}{"\n"}{end}' \
+                  | grep -c "^True$" || true)
                 ATTEMPTS=$((ATTEMPTS+1))
                 [ "$ESTABLISHED" -lt 3 ] && sleep 5
               done
               if [ "$ESTABLISHED" -lt 3 ]; then
-                echo "ERROR: only $ESTABLISHED/3 sessions reached Established"
+                echo "ERROR: only $ESTABLISHED/3 sessions have SessionEstablished=True"
                 kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh -o wide
                 exit 1
               fi
-              echo "OK: $ESTABLISHED/3 sessions are Established"
+              echo "OK: $ESTABLISHED/3 sessions have SessionEstablished=True"
 
       finally:
         - delete:
