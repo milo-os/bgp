@@ -3,12 +3,6 @@ kind: Configuration
 metadata:
   name: bgp-e2e
 spec:
-  # Run tests sequentially so that each test can create BGPEndpoints named after
-  # the actual kind worker nodes (bgp-e2e-worker, bgp-e2e-worker2, bgp-e2e-worker3)
-  # without conflicting with other tests. The session reconciler uses LOCAL_ENDPOINT
-  # (set to $(NODE_NAME)) to filter sessions, so endpoint names must exactly match
-  # the node names.
-  concurrent: false
   timeouts:
     apply: 2m
     assert: 5m
