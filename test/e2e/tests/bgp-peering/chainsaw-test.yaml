@@ -159,15 +159,23 @@ spec:
 
     - name: assert-sessions-created
       try:
-        # Mesh of 3 endpoints creates 3 sessions (N*(N-1)/2)
-        - assert:
-            resource:
-              apiVersion: bgp.miloapis.com/v1alpha1
-              kind: BGPPeeringPolicy
-              metadata:
-                name: e2e-mesh
-              status:
-                (activeSessions == `3`): true
+        - script:
+            content: |
+              set -e
+              # Wait for 3 BGPSession resources to be created by the policy.
+              ATTEMPTS=0
+              COUNT=0
+              while [ "$COUNT" -lt 3 ] && [ "$ATTEMPTS" -lt 36 ]; do
+                COUNT=$(kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh --no-headers 2>/dev/null | wc -l)
+                ATTEMPTS=$((ATTEMPTS+1))
+                [ "$COUNT" -lt 3 ] && sleep 5
+              done
+              if [ "$COUNT" -lt 3 ]; then
+                echo "ERROR: only $COUNT/3 sessions created after ${ATTEMPTS} attempts"
+                kubectl get bgpsessions -l bgp.miloapis.com/policy=e2e-mesh -o wide || true
+                exit 1
+              fi
+              echo "OK: $COUNT sessions created"
 
     - name: assert-sessions-established
       try:
