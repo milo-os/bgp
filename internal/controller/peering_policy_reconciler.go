@@ -24,32 +24,20 @@ import (
 // BGPEndpoint objects and creating BGPSession resources for every pair (mesh mode).
 // It also watches BGPEndpoint events to re-reconcile policies when endpoints change.
 //
-// Because the operator runs as a DaemonSet, multiple pods watch the same
-// BGPPeeringPolicy resources. To avoid races where every pod tries to create
-// and garbage-collect the same BGPSession objects simultaneously, only one pod
-// performs writes. The "designated reconciler" is determined deterministically:
-// the pod whose LocalEndpoint name sorts first among all registered BGPEndpoints.
-// This requires no external coordination (no leases) and is always consistent.
+// Because the operator runs as a DaemonSet, multiple pods reconcile the same
+// BGPPeeringPolicy resources concurrently. This is safe because:
+//   - Session creation uses errors.IsAlreadyExists to handle concurrent creates.
+//   - Session GC only deletes sessions whose names are not in the computed desired
+//     set, and all pods compute identical desired sets from the same policy spec.
+//   - Status patches may conflict; conflicts cause a requeue and eventual convergence.
 type PeeringPolicyReconciler struct {
 	client.Client
-	// LocalEndpoint is the name of the BGPEndpoint representing this pod's node.
-	// Used to determine whether this pod is the designated reconciler.
-	LocalEndpoint string
 }
 
 // Reconcile handles BGPPeeringPolicy events.
 // For "mesh" mode, it creates a BGPSession for every unique pair of matching endpoints
 // and removes sessions that no longer correspond to a valid pair.
 func (r *PeeringPolicyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	// Only the "designated" pod (the one whose LocalEndpoint sorts first among all
-	// registered BGPEndpoints) performs writes. Non-designated pods skip reconciliation
-	// silently. This prevents DaemonSet pods from racing over the same sessions.
-	designated := r.isDesignatedReconciler(ctx)
-	log.Printf("bgp/policy: Reconcile %s: designated=%v localEndpoint=%s", req.Name, designated, r.LocalEndpoint)
-	if !designated {
-		return ctrl.Result{}, nil
-	}
-
 	var policy bgpv1alpha1.BGPPeeringPolicy
 	if err := r.Get(ctx, req.NamespacedName, &policy); err != nil {
 		if client.IgnoreNotFound(err) != nil {
@@ -326,31 +314,6 @@ func isOwnedByPolicy(session *bgpv1alpha1.BGPSession, policy *bgpv1alpha1.BGPPee
 	return false
 }
 
-// isDesignatedReconciler returns true when this pod's LocalEndpoint is the
-// first endpoint (alphabetically) in the full list of registered BGPEndpoints.
-//
-// The designated pod is the sole writer of BGPSession resources on behalf of
-// BGPPeeringPolicies. Other pods skip the reconcile loop entirely, so they never
-// race to create or garbage-collect the same sessions.
-//
-// Edge cases:
-//   - No endpoints registered yet: returns false (no-one reconciles; a requeue
-//     via RequeueAfter handles this once endpoints appear).
-//   - LocalEndpoint not in the list (pod not yet registered): returns false.
-func (r *PeeringPolicyReconciler) isDesignatedReconciler(ctx context.Context) bool {
-	var list bgpv1alpha1.BGPEndpointList
-	if err := r.List(ctx, &list); err != nil {
-		log.Printf("bgp/policy: list BGPEndpoints for designation check: %v", err)
-		return false
-	}
-	if len(list.Items) == 0 {
-		return false
-	}
-	sort.Slice(list.Items, func(i, j int) bool {
-		return list.Items[i].Name < list.Items[j].Name
-	})
-	return list.Items[0].Name == r.LocalEndpoint
-}
 
 // mapEndpointToPolicies returns reconcile requests for all BGPPeeringPolicies whose
 // selector matches the given BGPEndpoint. Used to re-reconcile policies when endpoints change.
