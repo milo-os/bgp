@@ -390,11 +390,14 @@ it detects a failure, it:
 
 `FullReconcile` re-applies all desired state:
 
-- `BGPConfiguration` through `StartBgp` (re-initializes the speaker).
-- All `BGPSession` resources through `AddPeer`/`UpdatePeer`.
+- All `BGPSession` resources through `AddPeer`/`UpdatePeer` (resolving
+  endpoints and rebuilding the GoBGP peer struct for each).
 - All `BGPAdvertisement` resources by bumping a reconcile-trigger annotation,
   which causes the reconciler to re-inject prefixes.
 - All `BGPRoutePolicy` resources the same way.
+
+The `BGPConfiguration` is handled separately by the `ConfigReconciler` through
+its normal watch-based reconciliation.
 
 After `FullReconcile`, GoBGP state is fully consistent with the CRDs.
 
