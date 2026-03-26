@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -14,83 +15,131 @@ import (
 	bgpv1alpha1 "go.miloapis.com/bgp/api/v1alpha1"
 )
 
-const statusPollInterval = 10 * time.Second
+const peerWatchRetryInterval = 2 * time.Second
 
-// RunStatusPoller polls GoBGP every statusPollInterval and updates BGPSession.status.
-// It also emits Prometheus metrics.
+// RunPeerStateWatcher streams GoBGP peer state change events and updates
+// BGPSession status fields and Prometheus metrics on each transition.
+// It automatically reconnects the event stream on error.
 // This function blocks until ctx is cancelled.
-func RunStatusPoller(ctx context.Context, k8sClient client.Client, gobgp *GoBGPClient) {
-	ticker := time.NewTicker(statusPollInterval)
-	defer ticker.Stop()
-
+func RunPeerStateWatcher(ctx context.Context, k8sClient client.Client, gobgp *GoBGPClient) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			pollAndUpdate(ctx, k8sClient, gobgp)
+		default:
+		}
+
+		c := gobgp.Client()
+		if c == nil {
+			log.Printf("bgp/status: GoBGP not connected, retrying in %s", peerWatchRetryInterval)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(peerWatchRetryInterval):
+			}
+			continue
+		}
+
+		if err := watchAndUpdatePeers(ctx, c, k8sClient); err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("bgp/status: stream error: %v — restarting in %s", err, peerWatchRetryInterval)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(peerWatchRetryInterval):
+				}
+			}
 		}
 	}
 }
 
-func pollAndUpdate(ctx context.Context, k8sClient client.Client, gobgp *GoBGPClient) {
-	c := gobgp.Client()
-	if c == nil {
-		return
+// watchAndUpdatePeers opens a WatchEvent stream filtered for peer state changes
+// and updates BGPSession status for each event until the stream ends or ctx is cancelled.
+func watchAndUpdatePeers(ctx context.Context, c gobgpapi.GobgpApiClient, k8sClient client.Client) error {
+	stream, err := c.WatchEvent(ctx, &gobgpapi.WatchEventRequest{
+		Peer: &gobgpapi.WatchEventRequest_Peer{},
+	})
+	if err != nil {
+		return fmt.Errorf("WatchEvent: %w", err)
 	}
 
-	// Collect peer states from GoBGP keyed by neighbor address.
-	peerStates := make(map[string]*gobgpapi.Peer)
-	stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{EnableAdvertised: true})
-	if err != nil {
-		log.Printf("bgp/status: ListPeer: %v", err)
-		return
-	}
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
-			break
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("stream recv: %w", err)
+			}
 		}
-		p := resp.Peer
-		if p != nil && p.Conf != nil {
-			peerStates[p.Conf.NeighborAddress] = p
+
+		peerEvent := resp.GetPeer()
+		if peerEvent == nil {
+			continue
+		}
+
+		peer := peerEvent.Peer
+		if peer == nil {
+			continue
+		}
+
+		if err := handlePeerEvent(ctx, k8sClient, peer); err != nil {
+			log.Printf("bgp/status: handle peer event: %v", err)
 		}
 	}
+}
 
-	// List all BGPSession resources and update their status.
+// handlePeerEvent finds the BGPSession whose remote endpoint matches the peer's
+// neighbor address and updates its status fields and Prometheus metrics.
+func handlePeerEvent(ctx context.Context, k8sClient client.Client, peer *gobgpapi.Peer) error {
+	if peer.State == nil {
+		return nil
+	}
+
+	neighborAddr := peer.State.NeighborAddress
+	if neighborAddr == "" {
+		return nil
+	}
+
+	// List all BGPSession resources and find the one matching this neighbor.
 	var sessionList bgpv1alpha1.BGPSessionList
 	if err := k8sClient.List(ctx, &sessionList); err != nil {
-		log.Printf("bgp/status: list BGPSessions: %v", err)
-		return
+		return fmt.Errorf("list BGPSessions: %w", err)
 	}
 
+	matched := false
 	for i := range sessionList.Items {
 		sess := &sessionList.Items[i]
 		if sess.DeletionTimestamp != nil {
 			continue
 		}
 
-		// Resolve the remote endpoint to get the neighbor address GoBGP uses.
+		// Resolve the remote endpoint to get the address GoBGP uses.
 		var remoteEP bgpv1alpha1.BGPEndpoint
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: sess.Spec.RemoteEndpoint}, &remoteEP); err != nil {
 			// Endpoint may not exist yet — skip silently; the session reconciler will handle it.
 			continue
 		}
 
-		gobgpPeer, found := peerStates[remoteEP.Spec.Address]
-		if !found {
+		if remoteEP.Spec.Address != neighborAddr {
 			continue
 		}
 
-		sessionState, isEstablished := peerStateToString(gobgpPeer)
+		matched = true
+
+		sessionState, isEstablished := peerStateToString(peer)
 		prevState := sess.Status.SessionState
 
 		patch := client.MergeFrom(sess.DeepCopy())
 		sess.Status.SessionState = sessionState
 
-		// Count received/advertised prefixes.
+		// Count received/advertised prefixes across all address families.
 		var rxPrefixes, txPrefixes int64
-		for _, af := range gobgpPeer.AfiSafis {
+		for _, af := range peer.AfiSafis {
 			if af.State != nil {
 				rxPrefixes += int64(af.State.Received)
 				txPrefixes += int64(af.State.Advertised)
@@ -130,7 +179,16 @@ func pollAndUpdate(ctx context.Context, k8sClient client.Client, gobgp *GoBGPCli
 		// Emit Prometheus metrics keyed on session name.
 		RecordSessionState(sess.Name, sessionState)
 		RecordReceivedPrefixes(sess.Name, rxPrefixes)
+
+		// Only one session per neighbor address — no need to continue.
+		break
 	}
+
+	if !matched {
+		log.Printf("bgp/status: peer event for %s did not match any BGPSession", neighborAddr)
+	}
+
+	return nil
 }
 
 // peerStateToString maps GoBGP peer state to a human-readable string.
