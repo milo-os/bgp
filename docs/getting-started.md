@@ -16,7 +16,7 @@ This guide walks you through deploying the BGP control plane on a Kubernetes clu
 - A Kubernetes cluster with IPv6 enabled on nodes (each node must have a global-scope IPv6 address)
 - `kubectl` configured to reach your cluster
 - A GoBGP container image accessible to your cluster (the DaemonSet expects `gobgpd:latest` by default)
-- The BGP controller image (`ghcr.io/datum-cloud/bgp:latest`) accessible to your cluster
+- The BGP controller image (`ghcr.io/milo-os/bgp:latest`) accessible to your cluster
 
 ---
 

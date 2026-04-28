@@ -43,7 +43,7 @@ spec:
               mountPath: /config
       containers:
         - name: bgp
-          image: ghcr.io/datum-cloud/bgp:latest
+          image: ghcr.io/milo-os/bgp:latest
           imagePullPolicy: IfNotPresent
           args:
             - --gobgp-addr=127.0.0.1:50051

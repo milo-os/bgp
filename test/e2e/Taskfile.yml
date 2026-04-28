@@ -6,7 +6,7 @@ vars:
   KIND_IMAGE: kindest/node:v1.34.0
   KUBECONFIG: "{{.TASKFILE_DIR}}/.kubeconfig"
   REPO_ROOT: "{{.TASKFILE_DIR}}/../.."
-  BGP_IMG: ghcr.io/datum-cloud/bgp:e2e-local
+  BGP_IMG: ghcr.io/milo-os/bgp:e2e-local
   GOBGPD_IMG: gobgpd:e2e-local
 
 tasks:
