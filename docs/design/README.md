@@ -32,7 +32,7 @@ stage: alpha
 
 ## Summary
 
-`datum-cloud/bgp` is a declarative BGP control plane that manages BGP topology via Custom Resource Definitions (CRDs) on any Kubernetes-compatible API server, powered by [GoBGP](https://github.com/osrg/gobgp). It uses the Kubernetes API as a control plane framework — not as a container orchestrator. The controller runs anywhere you have a Kubernetes-compatible API server (full clusters, k3s, KCP, or standalone kube-apiserver). No kubelet, scheduler, CNI, or pod networking is required. The API group is `bgp.miloapis.com/v1alpha1`.
+`milo-os/bgp` is a declarative BGP control plane that manages BGP topology via Custom Resource Definitions (CRDs) on any Kubernetes-compatible API server, powered by [GoBGP](https://github.com/osrg/gobgp). It uses the Kubernetes API as a control plane framework — not as a container orchestrator. The controller runs anywhere you have a Kubernetes-compatible API server (full clusters, k3s, KCP, or standalone kube-apiserver). No kubelet, scheduler, CNI, or pod networking is required. The API group is `bgp.miloapis.com/v1alpha1`.
 
 Resources represent things — endpoints, sessions, policies — not imperative commands. The controller is topology-agnostic: it reconciles CRDs into GoBGP gRPC calls without embedded knowledge of nodes, clusters, borders, or network topology. Any system that can create Kubernetes objects can produce BGP topology by writing BGP CRDs.
 
