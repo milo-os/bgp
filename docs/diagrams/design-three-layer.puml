@@ -1,0 +1,25 @@
+@startuml design-three-layer
+top to bottom direction
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 13
+skinparam shadowing false
+
+skinparam rectangle {
+  RoundCorner 8
+  BorderColor #0C1D31
+  FontColor #0C1D31
+}
+
+!$BG = "#D5E5F5"
+!$BG_EXT = "#E0E8EC"
+!$GRAY = "#4D6356"
+
+rectangle "**CRD Producers**\n<size:11><color:$GRAY>Node operator  ·  cluster discovery  ·  human operator</color></size>" as producers $BG_EXT
+rectangle "**BGP Controller**\n<size:11><color:$GRAY>Watches CRDs  ·  reconciles into GoBGP via gRPC</color></size>" as controller $BG
+rectangle "**GoBGP + Kernel FIB**\n<size:11><color:$GRAY>BGP sessions  ·  RIB  ·  route sync via netlink (proto 196)</color></size>" as dataplane $BG
+
+producers -down-> controller : <size:10> Kubernetes API
+controller -down-> dataplane : <size:10> gRPC
+
+@enduml
