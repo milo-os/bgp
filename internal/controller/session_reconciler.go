@@ -238,32 +238,6 @@ func (r *SessionReconciler) queryPeerState(ctx context.Context, c gobgpapi.Gobgp
 	return "Unknown", false, 0
 }
 
-// peerStateToString maps GoBGP peer state to a human-readable string.
-// Returns (state string, isEstablished bool).
-func peerStateToString(p *gobgpapi.Peer) (string, bool) {
-	if p.State == nil {
-		return "Unknown", false
-	}
-	switch p.State.SessionState {
-	case gobgpapi.PeerState_UNKNOWN:
-		return "Unknown", false
-	case gobgpapi.PeerState_IDLE:
-		return "Idle", false
-	case gobgpapi.PeerState_CONNECT:
-		return "Connect", false
-	case gobgpapi.PeerState_ACTIVE:
-		return "Active", false
-	case gobgpapi.PeerState_OPENSENT:
-		return "OpenSent", false
-	case gobgpapi.PeerState_OPENCONFIRM:
-		return "OpenConfirm", false
-	case gobgpapi.PeerState_ESTABLISHED:
-		return "Established", true
-	default:
-		return "Unknown", false
-	}
-}
-
 // handleDelete calls GoBGP DeletePeer and removes the finalizer.
 func (r *SessionReconciler) handleDelete(ctx context.Context, c gobgpapi.GobgpApiClient, session *bgpv1alpha1.BGPSession) error {
 	if !controllerutil.ContainsFinalizer(session, SessionFinalizer) {

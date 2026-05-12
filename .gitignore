@@ -1,0 +1,8 @@
+bin/
+*.exe
+*.test
+*.out
+
+# E2E test artifacts
+test/e2e/.kubeconfig
+test/e2e/.kubeconfig.lock

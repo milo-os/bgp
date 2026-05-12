@@ -1,0 +1,55 @@
+version: '3'
+
+vars:
+  GOBIN: "{{.ROOT_DIR}}/bin"
+  CHAINSAW_VERSION: v0.2.12
+  CONTROLLER_GEN_VERSION: v0.18.0
+  GOLANGCI_LINT_VERSION: v2.1.6
+
+tasks:
+  build:
+    desc: Build all packages
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test ./...
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  generate:
+    desc: Generate deepcopy methods
+    cmds:
+      - controller-gen object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+  manifests:
+    desc: Generate CRD manifests
+    cmds:
+      - controller-gen crd paths="./api/..." output:crd:artifacts:config=config/crd
+
+  test-e2e:
+    desc: Run the full E2E suite (create cluster, deploy, test, teardown)
+    dir: test/e2e
+    cmds:
+      - task default
+
+  chainsaw:
+    desc: Install chainsaw test runner
+    cmds:
+      - GOBIN={{.GOBIN}} go install github.com/kyverno/chainsaw@{{.CHAINSAW_VERSION}}
+
+  tools:
+    desc: Install all development tools
+    cmds:
+      - GOBIN={{.GOBIN}} go install github.com/kyverno/chainsaw@{{.CHAINSAW_VERSION}}
+      - GOBIN={{.GOBIN}} go install sigs.k8s.io/controller-tools/cmd/controller-gen@{{.CONTROLLER_GEN_VERSION}}
