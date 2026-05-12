@@ -5,8 +5,6 @@ stage: alpha
 
 # API Reference: bgp.miloapis.com/v1alpha1
 
-> Last verified: 2026-03-16 against main (initial implementation)
-
 **API Group:** `bgp.miloapis.com`
 **Version:** `v1alpha1`
 **Stability:** Alpha — fields and defaults may change
@@ -136,6 +134,7 @@ spec:
 ```
 
 > [!NOTE]
+>
 > Labels on `BGPEndpoint` resources are how `BGPPeeringPolicy` selectors drive topology. Use labels to express topology attributes (region, cluster, tier) that peering policies should target.
 
 ---
@@ -261,6 +260,7 @@ spec:
 `BGPPeeringPolicy` automates `BGPSession` creation by selecting `BGPEndpoint` resources via label selectors and creating sessions based on the chosen topology mode. The `PeeringPolicyReconciler` watches for endpoint changes and ensures the desired set of `BGPSession` objects exists.
 
 > [!IMPORTANT]
+>
 > `BGPPeeringPolicy` creates and manages `BGPSession` resources. If you manually create a session that a policy would also create, the policy controller may conflict with it.
 
 ```bash
@@ -352,6 +352,7 @@ spec:
 `BGPAdvertisement` declares what IPv6 CIDR prefixes the local speaker should advertise into BGP. The `AdvertisementReconciler` injects declared prefixes into the GoBGP RIB using `AddPath`. On deletion, prefixes are withdrawn using `DeletePath`.
 
 > [!NOTE]
+>
 > BGPAdvertisement is a Phase 2 resource. The schema is registered and the reconciler is running, but this resource sees limited use in the initial alpha deployment.
 
 ```bash
@@ -397,6 +398,7 @@ spec:
 `BGPRoutePolicy` declares import or export filtering rules applied to BGP sessions. The `RoutePolicyReconciler` applies the policy to GoBGP's policy table using `AddPolicy`/`DeletePolicy`. Statements are evaluated in order; the first match wins.
 
 > [!NOTE]
+>
 > BGPRoutePolicy is a Phase 2 resource. The schema is registered and the reconciler is running, but this resource sees limited use in the initial alpha deployment.
 
 ```bash

@@ -1,0 +1,42 @@
+' Datum Cloud C4 Theme
+' Based on brand guidelines: https://www.datum.net/brand/color
+
+' Brand Colors
+!$DATUM_MIDNIGHT_FJORD = "#0C1D31"
+!$DATUM_PINE_FORGE = "#4D6356"
+!$DATUM_GLACIER_MIST = "#F6F6F5"
+
+' Element Background Colors - Internal
+!$DATUM_BG_SYSTEM = "#D5E5F5"
+!$DATUM_BG_CONTAINER = "#D5F5E0"
+!$DATUM_BG_COMPONENT = "#F5F0D5"
+
+' Element Background Colors - External
+!$DATUM_BG_EXT_SYSTEM = "#E0E8EC"
+!$DATUM_BG_EXT_CONTAINER = "#E0ECE4"
+
+' Person elements
+UpdateElementStyle("person", $bgColor="#F5D5D5", $borderColor="#BF9595", $fontColor=$DATUM_MIDNIGHT_FJORD)
+UpdateElementStyle("external_person", $bgColor="#E8E0E0", $borderColor=$DATUM_PINE_FORGE, $fontColor=$DATUM_PINE_FORGE)
+
+' System elements
+UpdateElementStyle("system", $bgColor=$DATUM_BG_SYSTEM, $borderColor=$DATUM_MIDNIGHT_FJORD, $fontColor=$DATUM_MIDNIGHT_FJORD)
+UpdateElementStyle("external_system", $bgColor=$DATUM_BG_EXT_SYSTEM, $borderColor=$DATUM_PINE_FORGE, $fontColor=$DATUM_PINE_FORGE)
+
+' Container elements
+UpdateElementStyle("container", $bgColor=$DATUM_BG_CONTAINER, $borderColor=$DATUM_MIDNIGHT_FJORD, $fontColor=$DATUM_MIDNIGHT_FJORD)
+UpdateElementStyle("external_container", $bgColor=$DATUM_BG_EXT_CONTAINER, $borderColor=$DATUM_PINE_FORGE, $fontColor=$DATUM_PINE_FORGE)
+
+' Component elements
+UpdateElementStyle("component", $bgColor=$DATUM_BG_COMPONENT, $borderColor=$DATUM_MIDNIGHT_FJORD, $fontColor=$DATUM_MIDNIGHT_FJORD)
+
+' Boundary styling
+UpdateBoundaryStyle("system", $bgColor=$DATUM_GLACIER_MIST, $borderColor=$DATUM_MIDNIGHT_FJORD, $fontColor=$DATUM_MIDNIGHT_FJORD)
+UpdateBoundaryStyle("container", $bgColor=$DATUM_GLACIER_MIST, $borderColor=$DATUM_MIDNIGHT_FJORD, $fontColor=$DATUM_MIDNIGHT_FJORD)
+
+' Relationship styling
+UpdateRelStyle("", $textColor=$DATUM_MIDNIGHT_FJORD, $lineColor=$DATUM_MIDNIGHT_FJORD)
+
+skinparam LegendBackgroundColor $DATUM_GLACIER_MIST
+skinparam LegendBorderColor $DATUM_MIDNIGHT_FJORD
+skinparam LegendFontColor $DATUM_MIDNIGHT_FJORD

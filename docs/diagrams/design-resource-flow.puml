@@ -1,0 +1,27 @@
+@startuml design-resource-flow
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+!include datum-theme.puml
+
+title BGP CRD Resource Relationships
+
+System(config, "BGPConfiguration", "Speaker identity:\nAS number, router ID, port")
+System(endpoint, "BGPEndpoint", "Speaker address\nand AS number")
+System(policy, "BGPPeeringPolicy", "Automates session creation\nthrough label selectors")
+System(session, "BGPSession", "Peering relationship:\nlocal and remote endpoint")
+System(advert, "BGPAdvertisement", "Prefixes to advertise")
+System(rpolicy, "BGPRoutePolicy", "Import/export filters")
+
+System_Ext(gobgp, "GoBGP", "BGP speaker on each node")
+
+Rel_D(policy, endpoint, "selects")
+Rel_D(policy, session, "creates")
+Rel_R(session, endpoint, "references")
+
+Rel_D(config, gobgp, "configures")
+Rel_D(session, gobgp, "programs peers")
+Rel_D(advert, gobgp, "injects routes")
+Rel_D(rpolicy, gobgp, "applies filters")
+
+SHOW_LEGEND()
+@enduml
